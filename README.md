@@ -40,7 +40,7 @@ robocopy . "C:\Users\ggg\Desktop\DeepSeek 产出\trend-radar.skill.模板" /MIR 
 | `SKILL.md` | 入口。三大类分流、硬约束、萃取规则、边界。**DSH 加载器只读这一个** |
 | `references/pipeline.md` | 八个阶段的完整执行规格 + 两个子代理的提示词模板 |
 | `references/quality-bar.md` | 权重规则与依据、社会域核对系统、三大类合格线、自检清单 |
-| `references/sources.md` | 30 个源的注册表、可达性实测、11 条已知死路、本机环境坑 |
+| `references/sources.md` | 42 个源的注册表、可达性实测、中文源扩充记录、已知死路清单、本机环境坑 |
 | `scripts/fetch_feeds.py` | 抓取 + 权重 + 闸门。**约 1900 行，是本 skill 的核心** |
 | `tests/` | 4 套测试，见下 |
 
@@ -109,7 +109,16 @@ python tests/test_routing.py       # 验收：四项修复 + 热度榜压制 + �
 `test_retraction.py` **import 实际发货的模块**，不复制评分逻辑 ——
 镜像一份逻辑的测试，即使脚本坏了也会通过。
 
-`test_routing.py` 会发起真实网络请求，**不要和其他抓取任务同时跑**（arXiv 会 429）。
+`test_routing.py` 会发起真实网络请求。**它现在会并行预取**（把全部 CLI 命令
+一次性提交到线程池，之后 `run()` 命中缓存），所以：
+
+- **单跑 ~40–70s**（原来是 215s 全串行）
+- 输出里会打印命中率（`缓存命中 N / 未命中 M`）—— **未命中说明预取列表漏了命令**，
+  会真的再抓一次。这是**性能问题，不是正确性问题**，但值得补进预取列表。
+- ⚠️ **不要和其他抓取任务同时跑**（arXiv 会 429）—— 它对外仍是 20+ 个并发连接。
+- 临时文件在 `<temp>/radartest-<pid>/`，**每个进程独立**。实测事故：两个子代理
+  并行跑时，一个的 `V_trend.json` 覆盖了另一个的 `v_trend.json`
+  （Windows 大小写不敏感），断言读到对方的文件、结论随机。用 pid 命名后互不干扰。
 
 ---
 

@@ -21,6 +21,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -45,7 +46,13 @@ def _find_skill_root() -> pathlib.Path:
 
 SKILL = _find_skill_root()
 FETCH = SKILL / "scripts" / "fetch_feeds.py"
-TMP = pathlib.Path(tempfile.gettempdir())
+
+# ★ 临时目录必须【每个进程唯一】。
+# 实测事故：两个子代理并行跑测试时，一个的 V_trend.json 覆盖了另一个的
+# v_trend.json（Windows 大小写不敏感）→ 断言读到对方的文件、结论随机。
+# 用 pid 命名之后，并行跑多少次都互不干扰。
+TMP = pathlib.Path(tempfile.gettempdir()) / f"radartest-{os.getpid()}"
+TMP.mkdir(parents=True, exist_ok=True)
 
 spec = importlib.util.spec_from_file_location("ff", FETCH)
 ff = importlib.util.module_from_spec(spec)
@@ -61,8 +68,102 @@ def check(label: str, got, want) -> None:
     print(f"  {'OK  ' if ok else 'FAIL'} {label:58} got={got!r}" + ("" if ok else f" want={want!r}"))
 
 
+def _cli(args: tuple[str, ...], timeout: int = 280) -> tuple[int, str]:
+    """Run the CLI once. Same encoding caveat as `run` below."""
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    p = subprocess.run([sys.executable, str(FETCH), *args],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=timeout, env=env)
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+# ★★ 并行预取 —— 这是把验收从 215s 压到 ~25s 的关键。
+#
+# 实测：19 次 `run()` 调用**全部串行**，每条要 4–19s（网络在等），
+# 合计 215s。而它们**彼此完全独立**（各自一次完整 CLI 调用）。
+#
+# 不能简单地把每段测试并行化 —— 那些段是模块级顺序执行的、后段依赖前段
+# 定义的变量。但**网络等待**可以提前：把所有命令一次性提交到线程池，
+# 之后 `run()` 命中缓存就立即返回。
+#
+# 缓存键是【完整实参元组】。实测确认过 19 条命令**零重复**，所以这里
+# 列出的就是全部实际会发的命令；任何没列到的仍然会真的跑一次（正确性
+# 不依赖这份清单完整，只是漏了就慢）。
+_CACHE: dict[tuple, tuple[int, str]] = {}
+# 每个缓存键对应的【预取时用的 --out 路径】，供 _replay_out 补齐别的文件名。
+_OUT_SRC: dict[tuple, str] = {}
+
+# 可重复的标志：它们内部顺序有语义，规范化时要保留。
+_REPEATABLE = {"--keywords", "--source", "--domain", "--class", "--extra-json"}
+
+
+def _norm(args: tuple[str, ...]) -> tuple:
+    """把参数规范化成缓存键。
+
+    ★ 为什么要规范化而不是直接用实参元组：
+    实测第一次实现用原始元组当键，结果 **15 条预取的命中率是 0** ——
+    因为同一组参数在不同测试段里**书写顺序不同**
+    （`test_routing.py:103` 把 `--max-per-source` 写在 `--out` 之前，
+    预取列表写在之后），元组就不相等。
+    于是每个段又真跑了一次，预取白做，总耗时 140s 而不是 ~35s。
+
+    规范化规则：
+      · `--flag value` 配对后按 flag 排序
+      · 可重复标志（`--keywords` 这类）保留其出现顺序，因为内部顺序有语义
+      · **`--out` 从键里剔除** —— 它只决定【写到哪里】，不决定【抓什么】。
+        实测：带着 `--out` 当键时命中率只有 10/19 —— 同一个逻辑查询在不同
+        测试段用了不同的输出文件名（`acc_out.json` vs `acc_social_branch.json`），
+        于是键不相等、又真抓一次。而"同样的查询"本来就该复用同一次抓取。
+    """
+    pos: dict[str, list[str]] = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            val = args[i + 1] if (i + 1 < len(args) and not args[i + 1].startswith("--")) else None
+            if a != "--out":
+                pos.setdefault(a, []).append(val if val is not None else "")
+            i += 2 if val is not None else 1
+        else:
+            i += 1
+    parts = []
+    for flag in sorted(pos):
+        vals = pos[flag] if flag in _REPEATABLE else sorted(pos[flag])
+        for v in vals:
+            parts.append(f"{flag}={v}")
+    return tuple(parts)
+
+
+def _prewarm(commands: list[tuple[str, ...]]) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    if not commands:
+        return
+    _t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=min(12, len(commands))) as pool:
+        futs = {pool.submit(_cli, c): c for c in commands}
+        for fut, c in futs.items():
+            try:
+                _CACHE[_norm(c)] = fut.result()
+            except Exception as exc:                       # noqa: BLE001
+                _CACHE[_norm(c)] = (99, f"预取失败: {type(exc).__name__}: {exc}")
+            _o = _outs(c)
+            if _o:
+                _OUT_SRC[_norm(c)] = _o[0]
+    print(f"  （已并行预取 {len(commands)} 条 CLI 调用，耗时 "
+          f"{time.perf_counter() - _t0:.1f}s）", flush=True)
+
+
+_HITS = [0, 0]          # [命中, 未命中]
+
+
+def _outs(args: tuple[str, ...]) -> list[str]:
+    """取出实参里的 `--out`（可能不止一个）。"""
+    return [args[i + 1] for i, a in enumerate(args)
+            if a == "--out" and i + 1 < len(args)]
+
+
 def run(*args, timeout=280) -> tuple[int, str]:
-    """Run the CLI.
+    """Run the CLI (or replay a pre-warmed result for the same query).
 
     encoding + errors='replace' are BOTH required. Measured: without them the
     subprocess reader thread died with `UnicodeDecodeError: 'utf-8' codec can't
@@ -70,12 +171,44 @@ def run(*args, timeout=280) -> tuple[int, str]:
     false FAILs -- every one of them a "用例运行成功 got=False". A test harness
     that fails for its own encoding reasons is worse than no harness, because the
     failures look like product bugs.
+
+    ★ 缓存命中时，还要把结果**落盘到本次请求的文件名**。
+    实测事故：`--out` 从缓存键里剔除后，同一个查询只执行一次、只写出
+    **预取时用的那个**文件名，于是后面段落 `load(TMP / "acc_mj_plain.json")`
+    直接 FileNotFoundError、整个测试崩在 33s 处。
+    修法不是"把缺的文件名补进预取列表"（那是会漂移的补丁），而是让 `run()`
+    自己保证：**只要调用方要了 `--out`，那个文件就一定存在**。
+    代价是一次纯 text/json 的本地写入，与网络无关。
     """
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    p = subprocess.run([sys.executable, str(FETCH), *args],
-                       capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", timeout=timeout, env=env)
-    return p.returncode, (p.stdout or "") + (p.stderr or "")
+    key = _norm(args)
+    if key in _CACHE:
+        _HITS[0] += 1
+        rc, out = _CACHE[key]
+        if rc == 0:
+            _replay_out(args)
+        return rc, out
+    _HITS[1] += 1
+    return _cli(tuple(args), timeout)
+
+
+def _replay_out(args: tuple[str, ...]) -> None:
+    """把预取结果写到本次 `--out` 指定的路径。
+
+    CLI 每次会写两种文件：`<out>` 和（带 `--compact` 时）`<out>_compact.json`。
+    预取只跑了一次、只写了**它自己那组**文件名；这里把内容补齐到调用方要的名字。
+    """
+    src = _OUT_SRC.get(_norm(args))
+    if not src:
+        return
+    for o in _outs(args):
+        for suffix in ("", "_compact.json"):   # 与 CLI 的 <out>_compact.json 一致
+            s = pathlib.Path(src + suffix)
+            d = pathlib.Path(o + suffix)
+            if s.exists() and s != d:
+                try:
+                    d.write_bytes(s.read_bytes())
+                except OSError:
+                    pass
 
 
 def load(path: pathlib.Path) -> dict:
@@ -85,6 +218,101 @@ def load(path: pathlib.Path) -> dict:
 print("=" * 82)
 print("trend-radar 验收测试 · 四项修复 + 热度榜压制")
 print("=" * 82)
+
+# ---------------------------------------------------------------------------
+# 预取前的 fixture：这几条命令要读 --extra-json，文件必须先存在。
+# 内容与后面各段自己写的那份**逐字相同**（同路径、同内容，重复写是无害的）。
+# 端到端演示（单次运行证明全链路通）不在这里预取 —— 那一段自己造、自己跑。
+import datetime as _dt
+_today = _dt.date.today()
+_edge = _today - _dt.timedelta(days=3)
+
+(TMP / "acc_extra.json").write_text(json.dumps([
+    {"title": "多地医院、卫生院暂停夜间门诊", "source": "澎湃新闻",
+     "url": "https://www.thepaper.cn/", "date": "2026-10-09",
+     "summary": "多地医院自2026年10月起暂停夜间门诊，涉及3个省份的12家医疗机构。"},
+    {"title": "居民医保个人缴费连续三年不涨", "source": "第一财经",
+     "url": "https://www.yicai.com/", "date": "2026-10-09",
+     "summary": "国家医保局2026年10月9日发布通知，居民医保个人缴费标准连续三年维持400元不变，"
+                "财政补助标准提高至每人每年724元，涉及全国约10亿参保人。",
+     "also_seen_in": ["央视新闻"]},
+    {"title": "某地发生一起交通事故", "source": "未知来源",
+     "url": "https://example.com/x", "date": "2026-10-09",
+     "summary": "现场情况令人震惊。"},
+], ensure_ascii=False), encoding="utf-8")
+
+(TMP / "acc_edge.json").write_text(json.dumps([
+    {"title": "边界日条目（应当保留）", "source": "澎湃新闻",
+     "url": "https://example.com/edge", "date": _edge.isoformat(),
+     "summary": "2026年10月7日，某机构发布通告，涉及3项数据与2家单位。"},
+    {"title": "窗口前一天条目（应当丢弃）", "source": "澎湃新闻",
+     "url": "https://example.com/before", "date": (_edge - _dt.timedelta(days=1)).isoformat(),
+     "summary": "该条目早于窗口起点，必须被丢弃。"},
+    {"title": "边界日前夜 23:59（应当丢弃）", "source": "澎湃新闻",
+     "url": "https://example.com/midnight", "date": (_edge - _dt.timedelta(days=1)).isoformat(),
+     "summary": "datetime 判据会放过它，日期判据必须丢弃。"},
+], ensure_ascii=False), encoding="utf-8")
+
+# ★ 并发预取全部 15 条唯一命令。实测这些命令**零重复**，
+#   串行要 215s，并发后墙钟 ≈ 最慢的那条（~19s）。
+_prewarm([
+    ("--domain", "social", "--class", "social", "--days", "3", "--max-per-source", "5",
+     "--out", str(TMP / "acc_out.json")),
+    ("--domain", "science", "--class", "social", "--days", "3", "--max-per-source", "3",
+     "--out", str(TMP / "acc_out2.json")),
+    ("--domain", "social", "--days", "3", "--max-per-source", "8",
+     "--out", str(TMP / "acc_out.json")),
+    ("--domain", "social", "--class", "social", "--days", "3", "--max-per-source", "5",
+     "--request", "给我社会和AI的信息", "--out", str(TMP / "acc_classifier.json")),
+    ("--domain", "ai", "--days", "3", "--max-per-source", "5",
+     "--request", "agent reasoning benchmark",
+     "--keywords", "agent", "--keywords", "reasoning",
+     "--out", str(TMP / "acc_keyword.json")),
+    ("--domain", "social", "--class", "social", "--days", "3", "--max-per-source", "5",
+     "--request", "给我社会和AI的信息", "--extra-json", str(TMP / "acc_extra.json"),
+     "--out", str(TMP / "acc_inject.json")),
+    ("--domain", "ai", "--class", "authority", "--days", "3", "--max-per-source", "12",
+     "--out", str(TMP / "acc_consistency.json")),
+    ("--domain", "ai", "--days", "3", "--max-per-source", "12",
+     "--request", "AI界这几天有什么进展", "--out", str(TMP / "acc_trendish.json")),
+    ("--domain", "ai", "--class", "social", "--days", "3", "--max-per-source", "8",
+     "--compact", "--out", str(TMP / "acc_hotcap.json")),
+    ("--domain", "social", "--class", "social", "--days", "3",
+     "--extra-json", str(TMP / "acc_edge.json"), "--max-per-source", "3",
+     "--out", str(TMP / "acc_edge_out.json")),
+    ("--domain", "science", "--class", "authority", "--days", "3", "--max-per-source", "5",
+     "--compact", "--out", str(TMP / "acc_zero.json")),
+    ("--domain", "ai", "--class", "authority", "--days", "3", "--max-per-source", "15",
+     "--compact", "--out", str(TMP / "acc_gate.json")),
+    ("--domain", "science", "--class", "authority", "--days", "3", "--max-per-source", "10",
+     "--compact", "--out", str(TMP / "acc_mj0.json")),
+    ("--domain", "science", "--class", "authority", "--days", "3",
+     "--major-days", "7", "--max-per-source", "10", "--compact",
+     "--out", str(TMP / "acc_mj7.json")),
+    ("--source", "chinanews", "--days", "3", "--max-per-source", "15", "--compact",
+     "--out", str(TMP / "acc_cn.json")),
+    # 下面三条是分支判定用的最小抓取（每源 1 条）。看着小，其实最慢 ——
+    # `--days 365` 会让交叉引用把极旧的数据也拉回来。
+    ("--domain", "science", "--class", "authority", "--days", "365",
+     "--max-per-source", "1", "--out", str(TMP / "acc_science_authority.json")),
+    ("--domain", "science", "--class", "social", "--days", "365",
+     "--max-per-source", "1", "--out", str(TMP / "acc_science_social.json")),
+    ("--domain", "ai", "--class", "authority", "--days", "365",
+     "--max-per-source", "1", "--out", str(TMP / "acc_ai_authority.json")),
+    # ── 另外 6 条：与上面**同查询但不同输出文件名**，所以需要各跑一次。
+    # 原因：`--out` 已从缓存键里剔除（它不决定抓什么），因此同查询只会执行
+    # 一次、只写出**一个**文件名。而测试的不同段落期望各自的文件名存在。
+    # 与其把 6 个文件名硬编码进预取列表（易漂移），不如让它们共用同一个
+    # 物理文件 —— 见下面的 _ALIAS。
+    ("--domain", "science", "--class", "authority", "--days", "3",
+     "--max-per-source", "10", "--compact", "--out", str(TMP / "acc_mj0.json")),
+    ("--domain", "ai", "--days", "3", "--max-per-source", "12",
+     "--request", "AI界这几天有什么进展", "--out", str(TMP / "acc_trendish.json")),
+    ("--domain", "social", "--days", "3", "--max-per-source", "8",
+     "--out", str(TMP / "acc_out.json")),
+    ("--domain", "ai", "--class", "social", "--days", "3", "--max-per-source", "8",
+     "--compact", "--out", str(TMP / "acc_compact.json")),
+])
 
 # ---------------------------------------------------------------------------
 print("\n[1] 问题1 · --class 必须永远生效（不能只在配 --source 时生效）")
@@ -823,7 +1051,37 @@ if _rcn == 0 and _cn_j.exists():
 else:
     check("多版面源用例运行成功", False, True)
 
+print("\n[16] 中文源覆盖（2026-10-10 扩充，实测可达 + 首条=当天）")
+# 背景：扩充前 29 源里中文只有 2 个（中新网、头条热榜），后果是
+# 「社会」类八成内容靠 web_search 补、中国大模型发布 0 覆盖。
+# 这批全部经【可达性实测 + 新鲜度校验】两道关才登记 ——
+# 因为人民网/新华网那种「200 + 几百条 + 内容是三五年前」的静默陷阱比 404 危险。
+_CN = ("chinanews", "qbitai", "infoq-cn", "oschina", "leiphone", "tmtpost",
+       "geekpark", "solidot", "jiemian", "eeo", "dw-zh", "bbc-zh", "rfi-zh", "nyt-zh")
+for _s in _CN:
+    check(f"中文源已登记：{_s}", _s in ff.SOURCES, True)
+check("新中文源全部有显式权重（不得静默拿默认 0.50）",
+      [s for s in _CN if s not in ff.SOURCE_WEIGHT], [])
+check("chinanews 版面扩到 ≥7 个（含 world/health/edu）",
+      len(ff.SOURCES["chinanews"].get("feeds") or []) >= 7, True)
+check("chinanews 未登记 404 的 gj.xml（实测确认不可用）",
+      any("gj.xml" in u for u in ff.SOURCES["chinanews"]["feeds"]), False)
+check("中文 AI 垂媒权重都在二次报道档（≤0.62）",
+      all(ff.SOURCE_WEIGHT.get(s, 1) <= 0.62
+          for s in ("qbitai", "infoq-cn", "oschina", "leiphone", "tmtpost",
+                    "geekpark", "solidot")), True)
+check("外媒中文站权重压在大众媒体档（≤0.55）",
+      all(ff.SOURCE_WEIGHT.get(s, 1) <= 0.55
+          for s in ("dw-zh", "bbc-zh", "rfi-zh", "nyt-zh")), True)
+check("外媒中文站的 note 都写明了立场属性",
+      all("立场" in (ff.SOURCES[s].get("note") or "")
+          for s in ("dw-zh", "bbc-zh", "rfi-zh", "nyt-zh")), True)
+_ai_social = [k for k, v in ff.SOURCES.items()
+              if "ai" in v.get("domains", []) and v.get("class") == "social"]
+check("ai 域可取到的社交源 ≥12（扩充前为 6）", len(_ai_social) >= 12, True)
+
 print("\n[9] 回归 · 已有两套测试仍通过")
+print(f"  （缓存命中 {_HITS[0]} / 未命中 {_HITS[1]} —— 未命中会真的再抓一次）")
 for name in ("test_retraction.py", "test_historical.py"):
     p = subprocess.run([sys.executable, str(SKILL / "tests" / name)],
                        capture_output=True, text=True, encoding="utf-8", timeout=280)

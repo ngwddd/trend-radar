@@ -181,7 +181,7 @@ python scripts/fetch_feeds.py --domain science --days 3 --compact     --out "$en
 **结果必须写 `--out` 文件，不要打控制台** —— Windows 控制台是 GBK，中文会乱码。
 （写 `$env:TEMP` 的只是抓取中间产物；**最终报告不写盘**。）
 
-**实测：30 个源全部可用**（2026-10-10 本机）。脚本已内置本机坑的修复，**不要拆掉**：
+**实测：42 个源全部可用**（2026-10-10 本机；中文 16 个）。脚本已内置本机坑的修复，**不要拆掉**：
 
 - **SSL**：本机 Python 用 OpenSSL 旧 CA 库（114 个 CA），`technologyreview.com` /
   `news.ycombinator.com` 会报 `certificate has expired`（**证书其实没过期**）。

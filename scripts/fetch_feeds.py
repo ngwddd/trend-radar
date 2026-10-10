@@ -161,6 +161,24 @@ SOURCE_WEIGHT = {
     # **这是有意的**：社会新闻天然是"多家都报"，独立印证正是这个域该用的尺子。
     # 想让单源直接过闸就得把权重抬到 0.90 一档，那是拿打分迁就结果，不做。
     "chinanews":           0.50,
+    # ── 中文 AI / 科技垂媒（2026-10-10 新增，全部二次报道）─────────────
+    # 都是转述别人的发布，所以压在 0.50–0.62：低于同行评审与官方一手，
+    # 高于 36kr（0.48，掺付费软文）。
+    "infoq-cn":            0.62,   # 工程实践向，编辑质量最高的一档
+    "qbitai":              0.58,   # 原创报道比例高
+    "solidot":             0.58,   # 技术社区视角，短讯为主
+    "leiphone":            0.55,   # AI 产业向
+    "geekpark":            0.55,   # 产品/产业向
+    "tmtpost":             0.52,   # 科技商业向，软文比例略高
+    "oschina":             0.50,   # 开源生态，量大但编辑轻
+    # ── 中文专业媒体 ────────────────────────────────────────────────
+    "jiemian":             0.74,   # 对齐已有的 yicai（第一财经）档
+    "eeo":                 0.72,   # 财经深度，同档取低
+    # ── 中文国际视角（立场明确，压在大众媒体档）─────────────────────
+    "dw-zh":               0.55,
+    "bbc-zh":              0.55,
+    "nyt-zh":              0.55,
+    "rfi-zh":              0.52,
     # -- trend boards: popularity signal, NOT a credibility signal --
     "toutiao-hot":         0.35,
     "google-trends-us":    0.35,
@@ -631,6 +649,12 @@ SOURCES: dict[str, dict] = {
             "https://www.chinanews.com.cn/rss/society.xml",       # 社会
             "https://www.chinanews.com.cn/rss/china.xml",         # 国内
             "https://www.chinanews.com.cn/rss/finance.xml",       # 财经
+            # 2026-10-10 实测新增（全部 200 / 首条当天）：
+            "https://www.chinanews.com.cn/rss/world.xml",         # 国际
+            "https://www.chinanews.com.cn/rss/health.xml",        # 健康
+            "https://www.chinanews.com.cn/rss/edu.xml",           # 教育
+            # ⚠️ `gj.xml` 实测 HTTP 404 —— 国际版面的正确路径是 `world.xml`。
+            #    不登记猜测的 URL（这条是实测确认过的）。
         ],
         "label": "中国新闻网",
         "status": "OK",
@@ -638,6 +662,110 @@ SOURCES: dict[str, dict] = {
                 "实测首条时间戳=当天，不是停更存档源"
                 "（对比：人民网 RSS 返回 200+100 条但内容是 2025-06 的、"
                 "新华网 200+300 条是 2022-12 的 —— 那类静默陷阱比 404 危险得多）",
+    },
+
+    # ── 中文 AI / 科技垂媒（2026-10-10 实测新增）────────────────────────
+    # 背景：此前 `--domain ai` 的中文侧几乎是空的 —— 中国大模型发布、
+    # 国内 AI 产业动向**连续多次跑批 0 覆盖**，只能靠 web_search 补。
+    # 下面 6 个源全部实测：HTTP 200 / 首条=当天 / 有摘要。
+    #
+    # 权重区间 0.50–0.62：都是**二次报道**（转述别人的发布），
+    # 所以低于同行评审（0.86–0.92）与官方一手（0.78–0.85），
+    # 高于 36kr（0.48，掺付费软文）。
+    # 单源过不了 0.6 真值闸门（0.4×0.55+0.6×0.55≈0.55）—— **这是有意的**，
+    # 国内 AI 新闻天然多家都报，靠独立印证加成（+0.12）才是这个域该用的尺子。
+    "qbitai": {
+        "kind": "rss", "group": "ai", "domains": ["ai"], "class": "social",
+        "url": "https://www.qbitai.com/feed",
+        "label": "量子位", "status": "OK",
+        "note": "中文 AI 垂媒，原创报道比例高。实测 1.1s / 10 条 / 首条当天",
+    },
+    "infoq-cn": {
+        "kind": "rss", "group": "ai", "domains": ["ai"], "class": "social",
+        "url": "https://www.infoq.cn/feed",
+        "label": "InfoQ 中文", "status": "OK",
+        "note": "工程实践向，偏架构与落地。实测 0.9s / 20 条 / 首条当天。"
+                "⚠️ 正文页常需 JS 渲染，web_fetch 只拿到标题",
+    },
+    "oschina": {
+        "kind": "rss", "group": "ai", "domains": ["ai"], "class": "social",
+        "url": "https://www.oschina.net/news/rss",
+        "label": "开源中国", "status": "OK",
+        "note": "开源生态向，量大（50 条）。实测 3.3s / 首条当天",
+    },
+    "leiphone": {
+        "kind": "rss", "group": "ai", "domains": ["ai"], "class": "social",
+        "url": "https://www.leiphone.com/feed",
+        "label": "雷锋网", "status": "OK",
+        "note": "AI 产业向。实测 1.9s / 20 条 / 首条当天。"
+                "⚠️ 其 AI 子站 leiphone-ai 实测 HTTP 500，不要用那个路径",
+    },
+    "tmtpost": {
+        "kind": "rss", "group": "ai", "domains": ["ai", "social"], "class": "social",
+        "url": "https://www.tmtpost.com/rss.xml",
+        "label": "钛媒体", "status": "OK",
+        "note": "科技商业向，兼有产业与政策。实测 3.6s / 18 条 / 首条当天",
+    },
+    "geekpark": {
+        "kind": "rss", "group": "ai", "domains": ["ai"], "class": "social",
+        "url": "https://www.geekpark.net/rss",
+        "label": "极客公园", "status": "OK",
+        "note": "产品与产业向。实测 3.8s / 30 条 / 首条当天",
+    },
+    "solidot": {
+        "kind": "rss", "group": "ai", "domains": ["ai", "science"], "class": "social",
+        "url": "https://www.solidot.org/index.rss",
+        "label": "Solidot", "status": "OK",
+        "note": "奇客资讯，科技/科学短讯，倾向技术社区视角。"
+                "实测 2.6s / 20 条 / 首条当天",
+    },
+
+    # ── 中文专业媒体（2026-10-10 实测新增）─────────────────────────────
+    "jiemian": {
+        "kind": "rss", "group": "general", "domains": ["social", "ai"], "class": "social",
+        "url": "https://a.jiemian.com/index.php?m=article&a=rss",
+        "label": "界面新闻", "status": "OK",
+        "note": "上海报业旗下财经/商业媒体。实测 5.1s / 30 条 / 首条当天。"
+                "权重 0.74 对齐已有的 yicai（第一财经）档",
+    },
+    "eeo": {
+        "kind": "rss", "group": "general", "domains": ["social"], "class": "social",
+        "url": "https://www.eeo.com.cn/rss.xml",
+        "label": "经济观察报", "status": "OK",
+        "note": "财经深度报道。实测 1.4s / 11 条 / 首条当天（法治/社会类也进）",
+    },
+
+    # ── 中文国际视角（2026-10-10 实测新增）─────────────────────────────
+    # ⚠️ 权重统一压在大众媒体档（0.52–0.55），且 note 必须写明立场属性 ——
+    # 它们有编辑标准，但涉华议题立场明确，不能当不带观点的通稿源用。
+    "dw-zh": {
+        "kind": "rss", "group": "general", "domains": ["social"], "class": "social",
+        "url": "https://rss.dw.com/rdf/rss-chi-all",
+        "label": "德国之声中文", "status": "OK",
+        "note": "德国公共广播。实测 1.3s / 53 条 / 首条当天。"
+                "⚠️ 涉华议题立场明确，引用时须标明出处立场",
+    },
+    "bbc-zh": {
+        "kind": "rss", "group": "general", "domains": ["social"], "class": "social",
+        "url": "https://feeds.bbci.co.uk/zhongwen/simp/rss.xml",
+        "label": "BBC 中文", "status": "OK",
+        "note": "实测 0.7s / 38 条 / 首条当天。"
+                "⚠️ 涉华议题立场明确，引用时须标明出处立场",
+    },
+    "rfi-zh": {
+        "kind": "rss", "group": "general", "domains": ["social"], "class": "social",
+        "url": "https://www.rfi.fr/cn/rss",
+        "label": "法国国际广播电台中文", "status": "OK",
+        "note": "实测 0.2s / 30 条 / 首条当天。"
+                "⚠️ 涉华议题立场明确，引用时须标明出处立场",
+    },
+    "nyt-zh": {
+        "kind": "rss", "group": "general", "domains": ["social", "ai"], "class": "social",
+        "url": "https://cn.nytimes.com/rss/",
+        "label": "纽约时报中文网", "status": "OK",
+        "note": "实测 0.3s / 20 条 / 首条 10-09。"
+                "⚠️ 涉华议题立场明确，引用时须标明出处立场。"
+                "⚠️ `/rss/technology/` 实测与根 feed 首条相同，疑为同一源，未单独登记",
     },
 }
 
