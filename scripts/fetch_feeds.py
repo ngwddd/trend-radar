@@ -2923,7 +2923,21 @@ def main() -> int:
               f"domain={args.domain!r}; use --list", file=sys.stderr)
         return 2
 
-    now = datetime.now(timezone.utc)
+    # ★ 日期边界必须用【用户本地时间】，不能用 UTC。
+    #
+    # 实测 bug（真实请求踩到）：北京时间 10-11 00:33 跑 `--days 1`，
+    # 用户要的是「今日」= 他本地的 10-11，但当时 UTC 还是 10-10 ——
+    # 于是窗口取的是 10-10，**10-11 一条都拿不到**（实测 returned 0）。
+    # 对 UTC+8 的用户，每天 00:00–08:00 都会这样。
+    #
+    # 为什么不能改成 UTC 算、本地显示：日期边界的语义是
+    # 「这一天发生了什么」，而**"这一天"是用户日历上的那一天**，
+    # 不是格林尼治的那一天。日报类工具跟着读者时区走是标准做法。
+    #
+    # 所有下游比较都已按 `.date()` 粒度（11 处一致），所以这里换成
+    # 本地日期之后，整条链路自洽，不需要动别处。
+    # `generated_at` 仍写带时区的本地时间（`isoformat()` 会带 offset）。
+    now = datetime.now().astimezone()
     since = now - timedelta(days=args.days)
     # 必须在这里定义，不能等到窗口过滤那一段 —— fetch 循环（更早）就要用它
     # 去放宽 Crossref 的**查询**窗口。
@@ -3133,7 +3147,6 @@ def main() -> int:
     # 热度榜 (class=trend) is exempt: a hot-search list has no per-item date and
     # is by definition current, so applying the window would wrongly empty it.
     kept, undated, dropped, trend_exempt = [], 0, 0, 0
-    major_kept = 0
     for entry in entries:
         if SOURCES.get(entry.get("source_key", ""), {}).get("class") == "trend":
             entry["in_window"] = True
@@ -3178,7 +3191,12 @@ def main() -> int:
                 f"经 --major-days {major_days} 作为【本周重大事件】纳入。"
                 f"引用时必须写明它不在基础时间窗内。")
             kept.append(entry)
-            major_kept += 1
+            # ⚠️ 这里【不】计 major_kept。
+            # 实测 bug：原本在此 `major_kept += 1`，但后面还有**去重合并** ——
+            # 被并掉的条目仍然被计了数，于是 `stats.major_events_kept` 报 10
+            # 而实际发出 8 条。**报出去的数比实际多**，与 `passed_both`
+            # 共用计数器那次是同一类错：计数点在管线的中段，而读者看的是末端。
+            # 改成从最终 `capped` 里数（见下方 stats 构造处）。
         else:
             entry["_dropped_window"] = True
             dropped += 1
@@ -3767,7 +3785,9 @@ def main() -> int:
             "external_dropped_out_of_window": dropped_external,
             # 宽窗口纳入数。与 dropped_out_of_window 并列 —— 它描述的是同一件事
             # 的另一个方向（放行而非丢弃），放在顶层会被读 stats 的下游漏掉。
-            "major_events_kept": major_kept,
+            # 从【最终发出的集合】里数，不在中段数 —— 见窗口过滤处的说明。
+            # 这样这个数字与读者实际看到的条数永远一致。
+            "major_events_kept": sum(1 for e in capped if e.get("major_window")),
             # ★ 数据指纹。用途：让「这次跑批内容变了」可归因。
             #
             # 实测（同参数连跑 3 次）：25 个源里 **22 个逐条完全一致**，
@@ -3910,8 +3930,8 @@ def main() -> int:
                       f"本条覆盖【不完整】")
                 for f_ in fails:
                     print(f"        - {f_}")
-        if major_kept:
-            print(f"  ★ 重大事件窗口: {major_kept} 条落在近 {args.days} 天之外，"
+        if _mj:
+            print(f"  ★ 重大事件窗口: {_mj} 条落在近 {args.days} 天之外，"
                   f"由 --major-days {args.major_days} 纳入 —— **引用时必须写明**")
         if degraded:
             print("  ★ 降级告警   :")

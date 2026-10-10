@@ -223,14 +223,16 @@ print("=" * 82)
 # 预取前的 fixture：这几条命令要读 --extra-json，文件必须先存在。
 # 内容与后面各段自己写的那份**逐字相同**（同路径、同内容，重复写是无害的）。
 # 端到端演示（单次运行证明全链路通）不在这里预取 —— 那一段自己造、自己跑。
-# ⚠️ 必须用 **UTC** 日期，不能用 `date.today()`。
-# 实测 bug（本机 UTC+8，凌晨跑必挂）：CLI 用 `datetime.now(timezone.utc)` 算窗口，
-# 而这里原先用本地日期。本地 2026-10-11 时 UTC 还是 2026-10-10 ——
-# 于是边界日算成 10-08，而 CLI 的窗口起点是 10-07，
-# **「应丢弃」的条目全部落进窗口**，3 条窗口断言在每天 00:00–08:00 稳定误报。
-# 用 UTC 之后两边同源，任何时刻跑都一致。
+# ⚠️ 日期必须与 CLI 同源。
+# 这段历史值得留着，因为两边我各错过一次：
+#   · CLI 原本用 `datetime.now(timezone.utc)` 算窗口 —— 对 UTC+8 的用户，
+#     每天 00:00–08:00 本地日期比 UTC 早一天，用户说"今天"却拿不到今天的条目
+#     （实测：北京 10-11 00:33 跑 --days 1，10-11 条目数 0）。
+#   · 于是我先把【测试】改成 UTC 去对齐 —— 那是在迁就一个错的实现。
+# 正解是让 CLI 用**用户本地日历**（日期边界的语义就是"读者日历上的那一天"），
+# 测试跟着用本地日期。两边同源，任何时刻、任何时区都一致。
 import datetime as _dt
-_today = _dt.datetime.now(_dt.timezone.utc).date()
+_today = _dt.date.today()
 _edge = _today - _dt.timedelta(days=3)
 
 (TMP / "acc_extra.json").write_text(json.dumps([
@@ -770,14 +772,16 @@ print("\n[11] 窗口粒度 · 边界日必须在内（本轮最大改动，之�
 # 原来的 bug：主窗口用 `dt >= since`（datetime 粒度），而 Crossref 只给日期
 # 粒度（一律 T00:00:00Z），于是窗口首日的每一条都被判「窗口外」。
 # 这里造边界日与前一天各一条，断言「前一天丢、当天留」。
-# ⚠️ 必须用 **UTC** 日期，不能用 `date.today()`。
-# 实测 bug（本机 UTC+8，凌晨跑必挂）：CLI 用 `datetime.now(timezone.utc)` 算窗口，
-# 而这里原先用本地日期。本地 2026-10-11 时 UTC 还是 2026-10-10 ——
-# 于是边界日算成 10-08，而 CLI 的窗口起点是 10-07，
-# **「应丢弃」的条目全部落进窗口**，3 条窗口断言在每天 00:00–08:00 稳定误报。
-# 用 UTC 之后两边同源，任何时刻跑都一致。
+# ⚠️ 日期必须与 CLI 同源。
+# 这段历史值得留着，因为两边我各错过一次：
+#   · CLI 原本用 `datetime.now(timezone.utc)` 算窗口 —— 对 UTC+8 的用户，
+#     每天 00:00–08:00 本地日期比 UTC 早一天，用户说"今天"却拿不到今天的条目
+#     （实测：北京 10-11 00:33 跑 --days 1，10-11 条目数 0）。
+#   · 于是我先把【测试】改成 UTC 去对齐 —— 那是在迁就一个错的实现。
+# 正解是让 CLI 用**用户本地日历**（日期边界的语义就是"读者日历上的那一天"），
+# 测试跟着用本地日期。两边同源，任何时刻、任何时区都一致。
 import datetime as _dt
-_today = _dt.datetime.now(_dt.timezone.utc).date()
+_today = _dt.date.today()
 _edge = _today - _dt.timedelta(days=3)        # --days 3 的窗口起点（日期粒度）
 _json_edge = TMP / "acc_edge.json"
 _json_edge.write_text(json.dumps([
