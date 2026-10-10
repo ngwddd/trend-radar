@@ -701,6 +701,35 @@ if _rc == 0 and _gt.exists():
 else:
     check("单源通道用例运行成功", False, True)
 
+print("\n[14] 源与权重表一致性（新源不得静默拿默认权重）")
+# 实测：新加的 `chinanews` 当时不在 SOURCE_WEIGHT 里，拿的是
+# `SOURCE_WEIGHT.get(k, 0.50)` 兜底默认值 —— 一个没人看过的默认值替我做掉了
+# 权重决定，而且只在反推分数时才被发现。这条断言把那类事故变成会响的警报。
+_unw = sorted(k for k in ff.SOURCES if k not in ff.SOURCE_WEIGHT)
+check("每个注册源都在 SOURCE_WEIGHT 里有显式权重", _unw, [])
+check("权重表里没有已下架源的死条目",
+      sorted(k for k in ff.SOURCE_WEIGHT if k not in ff.SOURCES), [])
+
+# 中文社会民生源
+check("chinanews 已注册", "chinanews" in ff.SOURCES, True)
+if "chinanews" in ff.SOURCES:
+    _cn = ff.SOURCES["chinanews"]
+    check("chinanews 是多版面源（rss_multi 而非 urls 镜像）", _cn.get("kind"), "rss_multi")
+    check("chinanews 的 feeds 数量 ≥3", len(_cn.get("feeds") or []) >= 3, True)
+    check("chinanews 归社交域", "social" in _cn.get("domains", []), True)
+    check("chinanews 走 social 路（否则社会域依旧是 3 个科技媒体）",
+          _cn.get("class"), "social")
+    # 权重必须"有意登记"，不能靠默认值。同时它应当是**二次报道**档位，
+    # 不该被抬到通讯社级（那等于让单源直接过闸，是拿打分迁就结果）。
+    check("chinanews 权重在二次报道档（0.45–0.60）",
+          0.45 <= ff.SOURCE_WEIGHT.get("chinanews", -1) <= 0.60, True)
+    # 单源过不了真值闸门是【有意的】—— 社会新闻靠多家独立印证才该过。
+    check("chinanews 单源真值分低于闸门（需印证才过，有意）",
+          ff.truth_weight("chinanews", "social") < ff.CREDIBILITY_THRESHOLD, True)
+
+# hnrss 已下架（抓 20 条全部并入 hn-frontpage，落地 0，两次运行都是）
+check("hnrss 已从注册表移除", "hnrss" in ff.SOURCES, False)
+
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):
     p = subprocess.run([sys.executable, str(SKILL / "tests" / name)],

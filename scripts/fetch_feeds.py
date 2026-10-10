@@ -21,7 +21,8 @@ import json
 import pathlib
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import (ThreadPoolExecutor, wait, as_completed,
+                                FIRST_COMPLETED)
 import ssl
 import sys
 import time
@@ -144,11 +145,22 @@ SOURCE_WEIGHT = {
     "phys-org":            0.62,
     "science-daily":       0.58,
     "hn-frontpage":        0.45,
-    "hnrss":               0.45,
     "hn-top":              0.45,
     "reddit-ml":           0.40,
     "ithome":              0.52,   # fast, lightly edited
     "36kr":                0.48,   # paid placement mixed in
+    # 中新社主办的中新网。**实测它原本不在本表里**，拿的是 `SOURCE_WEIGHT.get(k, 0.50)`
+    # 那个兜底默认值 —— 等于让一个未声明的默认值替我做权重决定，这不可审计。
+    # 显式登记并写明理由（与同级中文源对比）：
+    #   ithome 0.52  —— 快，但轻编辑
+    #   36kr   0.48  —— 掺付费软文
+    # 中新网取 0.50：通稿社背景、有编辑流程，但仍是**二次报道**
+    # （它报的是别人的一手，不是自己的发现），所以不给到通讯社级。
+    # ⚠️ 这个权重意味着**单源过不了真值闸门**（0.4×0.50+0.6×0.55 = 0.53 < 0.6），
+    # 只能靠多家独立印证（+0.12 印证加成）才过。
+    # **这是有意的**：社会新闻天然是"多家都报"，独立印证正是这个域该用的尺子。
+    # 想让单源直接过闸就得把权重抬到 0.90 一档，那是拿打分迁就结果，不做。
+    "chinanews":           0.50,
     # -- trend boards: popularity signal, NOT a credibility signal --
     "baidu-hot":           0.35,
     "toutiao-hot":         0.35,
@@ -203,6 +215,11 @@ CREDIBILITY_THRESHOLD = 0.6
 # 刻意【不】用源权重阈值来判（如 source_weight>=0.9）：那会变成第二套层级实现，
 # 而实测教训是「同一件事两处实现必然打架」（identity_of/entity_id 就是活例）。
 HARD_EVIDENCE_TYPES = frozenset({"peer-reviewed"})
+
+# 评分过程中发现的「登记了但没给权重」的源。见 truth_weight 里的说明。
+# 用集合而不是抛异常：一次跑批不该因为一个漏登记就整体失败，
+# 但这件事必须能被查出来（`--list` 会打印，测试会断言为空）。
+UNWEIGHTED_SOURCES: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # 问题4 修复：社会域没有权威源，无法做权威交叉核对 → 走另一套核对系统
@@ -370,16 +387,6 @@ SOURCES: dict[str, dict] = {
         "label": "Hacker News front page",
         "status": "OK",
         "note": "社区热度，不等于价值；仅作线索来源。必须用 curl UA，浏览器 UA 会被 419",
-    },
-    "hnrss": {
-        "kind": "rss",
-        "domains": ["ai", "science"],
-        "class": "social",
-        "group": "general",
-        "url": "https://hnrss.org/frontpage",
-        "label": "Hacker News (hnrss.org mirror)",
-        "status": "OK",
-        "note": "直接访问曾超时，用 retries 兜；与 hn-frontpage 内容重复，二选一即可",
     },
     # ---- 中文 / 公众热点 ----
     "36kr": {
@@ -622,6 +629,39 @@ SOURCES: dict[str, dict] = {
         "note": "英文世界搜索热度，含 approx_traffic 与原文链接；但榜单本体大量是人名/娱乐，"
                 "只有 related_news 有信息量。geo=CN 实测 HTTP 400，不可用",
     },
+
+    # ── 中文社会民生一手源 ──────────────────────────────────────────────
+    # 为什么必须加：实测 `--domain social --class social` 只有 3 个源，
+    # 且**全是科技媒体**（36氪创投 / IT之家 3C / Ars 英文科技）——
+    # 真正的社会民生中文源一个都没有。后果是社会类每跑一次，
+    # 八成内容靠 web_search 补，不是"有源可依"。
+    #
+    # `kind: rss_multi` 是为此新加的：中新网的 4 个版面是【不同内容】，
+    # 不是同内容镜像，所以不能用 `urls`（那个字段的语义是
+    # 「候选镜像，取第一个非空的」，见 L855 `urls = spec.get("urls") or [spec["url"]]`）。
+    # 也不该拆成 4 个源 —— 那会污染 `scanned` 源计数与降级分母
+    # （用户看到"7/11 源成功"，其实只有 8 家媒体）。
+    "chinanews": {
+        "kind": "rss_multi",
+        "group": "general",
+        "domains": ["social", "science"],
+        "class": "social",
+        # 实测 2026-10-10：4 个 feed 全部 HTTP 200、30 条、首条当天 21:47–21:49、带摘要。
+        # `gj.xml`（国际）HTTP 404 —— 不登记猜测的 URL。
+        # 注意必须用带 `www.` 的域名，裸域名会重定向。
+        "feeds": [
+            "https://www.chinanews.com.cn/rss/scroll-news.xml",   # 滚动（时效最强）
+            "https://www.chinanews.com.cn/rss/society.xml",       # 社会
+            "https://www.chinanews.com.cn/rss/china.xml",         # 国内
+            "https://www.chinanews.com.cn/rss/finance.xml",       # 财经
+        ],
+        "label": "中国新闻网",
+        "status": "OK",
+        "note": "中新社主办，社会民生中文一手源。4 个版面【并发抓取后合并去重】。"
+                "实测首条时间戳=当天，不是停更存档源"
+                "（对比：人民网 RSS 返回 200+100 条但内容是 2025-06 的、"
+                "新华网 200+300 条是 2022-12 的 —— 那类静默陷阱比 404 危险得多）",
+    },
 }
 
 # Measured blockers - kept here so nobody re-discovers them the hard way.
@@ -835,6 +875,52 @@ def fetch_atom_arxiv(spec: dict, n: int) -> list[dict]:
             entry["category"] = cat
             out.append(entry)
     return out
+
+
+def fetch_rss_multi(urls: list[str], label: str, ua: str | None = None,
+                    link_prefer: str = "alternate",
+                    timeout: int | None = None) -> tuple[list[dict], list[str]]:
+    """Fetch several DIFFERENT feeds of one outlet, concurrently, and merge them.
+
+    与 `_mirror_fetch` 的区别（这两个不能混用）：
+      `_mirror_fetch` —— 同一内容的多个**镜像**，取**第一个非空的**就停（竞速）
+      `fetch_rss_multi` —— 同一家的多个**不同版面**，**全部都要**（合并）
+
+    实测：中新网的「滚动 / 社会 / 国内 / 财经」是四个不同版面，
+    用 `urls` 只会拿到其中一个版面，另外三个的内容直接丢掉。
+
+    并发而非串行：实测中新网单 feed 0.5–6.4s（`scroll-news` 那次 6.38s），
+    串行 4 个最坏要 20s+；并发后取决于最慢的那个。
+    返回 (条目, 失败的 feed 列表) —— 失败必须能被调用方看见，
+    否则「4 个版面只成功 1 个」会静默地看起来像「这家今天内容少」。
+    """
+    out: list[dict] = []
+    failed: list[str] = []
+    pool = ThreadPoolExecutor(max_workers=max(1, len(urls)))
+    try:
+        futs = {pool.submit(fetch_rss, u, label, ua, link_prefer, timeout): u
+                for u in urls}
+        for fut in as_completed(futs):
+            u = futs[fut]
+            try:
+                got = fut.result()
+                out.extend(got)
+            except Exception as exc:                       # noqa: BLE001
+                failed.append(f"{u} → {type(exc).__name__}: {str(exc)[:70]}")
+    finally:
+        # ★ 不能写成 `with ThreadPoolExecutor(...)` —— 它的 __exit__ 会 join
+        #   全部线程，拿到结果后仍要等慢/挂掉的那些跑完。
+        #   实测（`_mirror_fetch` 那次）：拿到 51 条结果却仍耗 18.90s。
+        pool.shutdown(wait=False, cancel_futures=True)
+    # 同一版面可能被多个 feed 重复收录，按 URL 去重
+    seen, uniq = set(), []
+    for e in out:
+        k = e.get("url") or e.get("title")
+        if k in seen:
+            continue
+        seen.add(k)
+        uniq.append(e)
+    return uniq, failed
 
 
 def _mirror_fetch(spec: dict, label: str) -> list[dict]:
@@ -1071,7 +1157,6 @@ def fetch_crossref(spec: dict, n: int, since: datetime) -> list[dict]:
 # scored every HN item as "2 independent sources".
 SOURCE_IDENTITY = {
     "hn-frontpage": "hackernews",
-    "hnrss": "hackernews",
     "hn-top": "hackernews",
     # Both front the same preprint server; an arXiv paper appearing in the API
     # feed AND the daily RSS is one source, not two.
@@ -1844,6 +1929,12 @@ def truth_weight(source_key: str, cls: str, corroborated: bool = False,
     substitute for the record, so the record must be allowed to override it.
     """
     base = SOURCE_WEIGHT.get(source_key, 0.50)
+    if source_key and source_key not in SOURCE_WEIGHT and source_key in SOURCES:
+        # ★ 登记表里有、权重表里没有 = 静默拿默认值。
+        # 实测：新加的 `chinanews` 就是这样拿到 0.50 的 —— 权重决定被一个
+        # 没人看过的默认值替我做掉了，而且只在反推分数时才被发现。
+        # 不抛异常（会让整跑失败），但必须留痕，让 `--list` 和测试能查出来。
+        UNWEIGHTED_SOURCES.add(source_key)
     ev = EVIDENCE_WEIGHT[evidence_type_for(source_key, cls, entry)]
     score = 0.4 * base + 0.6 * ev
     if corroborated:
@@ -2540,6 +2631,10 @@ def main() -> int:
                 print(f"    {key:18} [{spec['status']}] {spec['group']:8} {doms:22} {spec['label']}")
                 if spec.get("note"):
                     print(f"    {'':18}  note: {spec['note']}")
+        _unweighted = sorted(k for k in SOURCES if k not in SOURCE_WEIGHT)
+        if _unweighted:
+            print(f"\n⚠ 未给权重的源（会静默拿默认 0.50）: {', '.join(_unweighted)}")
+            print("   → 每个源都应在 SOURCE_WEIGHT 里显式登记并写明理由。")
         print("\nMEASURED BLOCKERS (do not retry blindly)")
         for url, why in BLOCKED:
             print(f"  {url}\n      {why}")
@@ -2655,6 +2750,9 @@ def main() -> int:
     report: list[dict] = []
     dropped_external = 0
     archive_truncated: dict[str, int] = {}
+    # 版面级失败（只有 kind=rss_multi 会产生）。必须报出来 ——
+    # 「4 个版面只成功 1 个」不能看起来像「这家今天内容少」。
+    sub_feed_failures: dict[str, list[str]] = {}
     degraded: list[dict] = []
     stale_feeds: list[dict] = []
 
@@ -2691,6 +2789,14 @@ def main() -> int:
                 got = fetch_atom_arxiv(spec, args.max_per_source)
             elif spec["kind"] == "crossref":
                 got = fetch_crossref(spec, args.max_per_source, since)
+            elif spec["kind"] == "rss_multi":
+                got, sub_failed = fetch_rss_multi(
+                    spec["feeds"], spec["label"], spec.get("ua"),
+                    spec.get("link_prefer", "alternate"), src_timeout)
+                if sub_failed:
+                    # 版面级失败要能看见 —— 否则「4 个版面只成功 1 个」
+                    # 会看起来像「这家今天内容少」，是同一类静默陷阱。
+                    sub_feed_failures[key] = sub_failed
             elif spec["kind"] == "baidu_hot":
                 got = _mirror_fetch(spec, spec["label"])
             elif spec["kind"] == "toutiao_hot":
@@ -3401,6 +3507,7 @@ def main() -> int:
         "source_funnel": funnel,
         "degraded_streams": degraded,
         "archive_truncated": archive_truncated,
+        "sub_feed_failures": sub_feed_failures,
         "stats": {
             # `raw` counts entries BEFORE the errata drop, and each per-source row
             # in sources_report also reports pre-drop counts. Measured: an auditor
@@ -3529,6 +3636,12 @@ def main() -> int:
         if archive_truncated:
             for k, n in archive_truncated.items():
                 print(f"  大归档截断   : {k} 丢弃 {n} 条旧条目（只保留最新 {ARCHIVE_SCAN_LIMIT}）")
+        if sub_feed_failures:
+            for k, fails in sub_feed_failures.items():
+                print(f"  ★ 版面降级   : {k} 有 {len(fails)} 个版面失败，"
+                      f"本条覆盖【不完整】")
+                for f_ in fails:
+                    print(f"        - {f_}")
         if degraded:
             print("  ★ 降级告警   :")
             for d in degraded:

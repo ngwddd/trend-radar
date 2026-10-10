@@ -99,8 +99,11 @@ for label, key, cls, notices, want in cases:
     check(label, got, want)
 
 print("\n[4] 同一来源的不同入口必须合并（防虚假佐证）")
-check("hn-frontpage 与 hnrss 同源",
-      ff.identity_of("hn-frontpage") == ff.identity_of("hnrss"), True)
+# ⚠️ `hnrss` 已于 2026-10-10 从注册表移除 —— 它抓 20 条但全部被
+# `hn-frontpage` 判重合并，落地 0 条，占着名额不产出（实测两次运行都是）。
+# 所以这里不再断言 hnrss 的身份，改为断言【仍在册的】同源入口。
+check("hn-top 与 hn-frontpage 同源",
+      ff.identity_of("hn-top") == ff.identity_of("hn-frontpage"), True)
 check("arxiv-ai 与 arxiv-rss-ai 同源",
       ff.identity_of("arxiv-ai") == ff.identity_of("arxiv-rss-ai"), True)
 check("hn-top 也归 hackernews", ff.identity_of("hn-top"), "hackernews")
