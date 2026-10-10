@@ -4,9 +4,32 @@
 
 **触发词：「扫一下」**（以及「扫扫」「扫一遍」「扫描一下」）。
 
-> **已安装。** 位置 `~/.dsh/skills/trend-radar/`，DSH 会自动发现并加载。
-> 源模板在 `Desktop\DeepSeek 产出\trend-radar.skill.模板\` —— 改哪边都行，
-> 但改完记得同步，两处应逐字节一致（`tests\_*` 子代理产物除外）。
+**仓库**：<https://github.com/ngwddd/trend-radar> （公开 · MIT）
+
+---
+
+## 三个副本的关系（**改之前先看这里**）
+
+这个 skill 现在同时存在于三个地方，**装的那份就是 git 仓库**：
+
+| 位置 | 角色 |
+|---|---|
+| `~/.dsh/skills/trend-radar/` | **安装位置 + git 工作副本**。DSH 从这里加载 |
+| `Desktop\DeepSeek 产出\trend-radar.skill.模板\` | 源模板（历史遗留，非加载路径） |
+| `github.com/ngwddd/trend-radar` | 远端 |
+
+**推荐工作流**：直接改**安装目录**，然后
+
+```powershell
+cd ~/.dsh/skills/trend-radar
+git add -A; git commit -m "…"; git push
+# 再同步到模板（两处应逐字节一致）
+robocopy . "C:\Users\ggg\Desktop\DeepSeek 产出\trend-radar.skill.模板" /MIR /XD .git __pycache__ /XF _*
+```
+
+> ⚠️ **`git status` 会把 `docs\` 里的改动报成 modified** —— 那是正常的，
+> 不是错误。`tests\_*`（子代理产物）已被 `.gitignore` 排除。
+
 
 ---
 
