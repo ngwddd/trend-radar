@@ -215,7 +215,7 @@ python scripts/fetch_feeds.py --domain science --class authority \
 **它的活**：快。抓的是**「大家在说什么」**，不是「事实是什么」。
 
 ```bash
-python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per-source 15 --compact --out "$env:TEMP\radar_social.json"
+python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per-source 25 --compact --out "$env:TEMP\radar_social.json"
 ```
 
 **子代理提示词模板**（照抄，替换 `<DOM>` / `<主题>` / `<天数>`）：
@@ -223,7 +223,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per
 > 你是情报管线的**社会面**采集员。分类：`<DOM>`。主题：`<主题>`。时间窗：近 `<天数>` 天。
 >
 > 执行：
-> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class social --days <天数> --max-per-source 15 --compact --out "$env:TEMP\radar_social.json"`，
+> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class social --days <天数> --max-per-source 25 --compact --out "$env:TEMP\radar_social.json"`，
 >    然后读该 JSON（不要读原文页，除非某条必须核对）。
 > 2. 若不足以覆盖主题，用 `web_search` 补 2–4 次查询，**检索词带年份月份**。
 > 3. 从结果里挑出**最多 12 条**，按下面契约返回。
@@ -266,7 +266,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per
 **它的活**：慢但准。抓的是**「什么是真的」**。
 
 ```bash
-python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-per-source 15 --compact --out "$env:TEMP\radar_auth.json"
+python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-per-source 25 --compact --out "$env:TEMP\radar_auth.json"
 ```
 
 **子代理提示词模板**：
@@ -274,7 +274,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-
 > 你是情报管线的**权威面**采集员。分类：`<DOM>`。主题：`<主题>`。时间窗：近 `<天数>` 天。
 >
 > 执行：
-> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class authority --days <天数> --max-per-source 15 --compact --out "$env:TEMP\radar_auth.json"`，然后读该 JSON。
+> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class authority --days <天数> --max-per-source 25 --compact --out "$env:TEMP\radar_auth.json"`，然后读该 JSON。
 > 2. 补充：`web_search` 找该领域官方公告 / 机构发布（检索词带年份月份）。
 > 3. 对**确定要进核心区的 1–3 条**用 `web_fetch` 读正文，核对数字与结论。
 >
@@ -312,7 +312,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-
 **在子代理跑的时候做，不要等。**
 
 ```bash
-python scripts/fetch_feeds.py --class trend --max-per-source 15 --compact --out "$env:TEMP\radar_trend.json"
+python scripts/fetch_feeds.py --class trend --max-per-source 25 --compact --out "$env:TEMP\radar_trend.json"
 ```
 
 （热度榜**不分三大类** —— 它衡量的是全体公众的注意力。）

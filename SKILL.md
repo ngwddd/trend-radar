@@ -168,9 +168,9 @@ description: >
 python scripts/fetch_feeds.py --list                       # 三大类 + 注册表 + 实测可达性
 
 # 三路都带上 --domain（阶段1 判断出的那一类）
-python scripts/fetch_feeds.py --domain ai --class social    --days 3 --max-per-source 15 --compact --out "$env:TEMP\radar_social.json"
-python scripts/fetch_feeds.py --domain ai --class authority --days 3 --max-per-source 15 --compact --out "$env:TEMP\radar_auth.json"
-python scripts/fetch_feeds.py --class trend                 --max-per-source 15 --compact --out "$env:TEMP\radar_trend.json"
+python scripts/fetch_feeds.py --domain ai --class social    --days 3 --max-per-source 25 --compact --out "$env:TEMP\radar_social.json"
+python scripts/fetch_feeds.py --domain ai --class authority --days 3 --max-per-source 25 --compact --out "$env:TEMP\radar_auth.json"
+python scripts/fetch_feeds.py --class trend                 --max-per-source 25 --compact --out "$env:TEMP\radar_trend.json"
 
 python scripts/fetch_feeds.py --domain science --days 3 --compact     --out "$env:TEMP\radar_sci.json"   # 整类
 ```

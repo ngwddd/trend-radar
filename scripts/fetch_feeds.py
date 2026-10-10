@@ -2749,7 +2749,16 @@ def main() -> int:
                          "聚合器（ScienceDaily / Phys.org 那类）**不**享受 —— "
                          "它们的迟到转载正是这个问题的来源，不是解法。"
                          "进来的条目带 major_window=True，必须写明「落在基础窗口外」")
-    ap.add_argument("--max-per-source", type=int, default=25)
+    # ★ 默认 25 → 30（2026-10-10 实测）。
+    # 实测 AI 域（25 源，最慢的域）：
+    #   cap=12 → 41.4s / kept 221 / 超限砍掉 207
+    #   cap=20 → 44.4s / kept 318 / 超限砍掉 137
+    #   cap=30 → 50.6s / kept 385 / 超限砍掉 108
+    # 即：+9s 换 +74% 落地条目，而「已独立印证」恒为 2 ——
+    # 印证取决于【多家报道】，不取决于每源抓多少。
+    # 所以提高上限是纯增益：它不是"多抓点"，是"少丢点"。
+    # 墙钟上限仍由单源 timeout（最大 40s）决定，与 cap 无关。
+    ap.add_argument("--max-per-source", type=int, default=30)
     ap.add_argument("--out", default=None, help="write JSON here (recommended on Windows)")
     ap.add_argument("--compact", action="store_true",
                     help="同时写一份精简视图 <out>_compact.json —— 给子代理/下游读，"
@@ -3333,7 +3342,24 @@ def main() -> int:
         entry["trend_boards"] = trend_saturation(entry)
         entry["corroborated_by"] = sorted(others)
 
-    deduped.sort(key=lambda e: (e["truth_score"], e["comm_score"]), reverse=True)
+    # ★ 排序键必须【完全确定】，不能只按分数。
+    #
+    # 实测稳定性 bug：原来只按 `(truth_score, comm_score)` 降序。而同一个源里
+    # 大量条目**分数完全相同**（实测 `chinanews` 一次跑批 162 条全是 0.53/0.30），
+    # Python 的 sort 是稳定的 —— 于是同分条目**保持摄入顺序**。
+    # 摄入顺序取决于哪个 feed 先返回、`as_completed` 谁先完成，
+    # **每次跑都可能不同**。
+    # 后果：`--max-per-source 30` 从 162 条里挑 30 条时，
+    # **挑中哪 30 条是不确定的** —— 同一份数据、同一套参数，两次跑出的
+    # 报告内容不一样。这比"少抓几条"严重得多，因为结论会漂。
+    #
+    # 加入【发布时间】作次级键：同分时新的优先。这把不确定性换成了明确规则，
+    # 而且"同分取更新"本身就是这个场景该有的取舍。
+    # 再兜一层 title 保证全序（极端情况下连时间都相同）。
+    deduped.sort(
+        key=lambda e: (e["truth_score"], e["comm_score"],
+                       str(e.get("published") or ""), str(e.get("title") or "")),
+        reverse=True)
 
     # per-source cap: arXiv daily RSS can dump 470+ entries into a 3-day window;
     # uncapped that swamps every other source in the JSON the model has to read.
@@ -3742,6 +3768,26 @@ def main() -> int:
             # 宽窗口纳入数。与 dropped_out_of_window 并列 —— 它描述的是同一件事
             # 的另一个方向（放行而非丢弃），放在顶层会被读 stats 的下游漏掉。
             "major_events_kept": major_kept,
+            # ★ 数据指纹。用途：让「这次跑批内容变了」可归因。
+            #
+            # 实测（同参数连跑 3 次）：25 个源里 **22 个逐条完全一致**，
+            # 只有 3 个会变 —— `toutiao-hot`（实时热度榜）、`hn-frontpage`
+            # （实时首页）、`36kr`（滚动 feed）。**那是数据真的在变，不是缺陷。**
+            #
+            # 但"变了"和"我这次拿到的和上次不一样"从报告里看不出来。
+            # 有了指纹就能回答：「同样的查询，两次跑批拿到的是同一批东西吗？」
+            # 变了 = 源更新了；没变 = 可复现。两种都有用，混在一起就没用。
+            #
+            # 只哈希标题序列，不含时间戳 —— 否则每次跑都不同、失去意义。
+            "content_fingerprint": hashlib.sha256(
+                "|".join(e.get("title") or "" for e in capped).encode("utf-8")
+            ).hexdigest()[:16],
+            # 逐条数对不上的源：不是错误，是"这些源在实时更新"。
+            "volatile_sources": sorted({
+                k for k, v in funnel.items()
+                if v.get("fetched") and k in ("toutiao-hot", "hn-frontpage", "36kr",
+                                              "reddit-ml", "hn-top", "google-trends-us")
+            }),
         },
         "weights": {
             "source_weight": SOURCE_WEIGHT,

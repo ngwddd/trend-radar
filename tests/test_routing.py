@@ -223,8 +223,14 @@ print("=" * 82)
 # 预取前的 fixture：这几条命令要读 --extra-json，文件必须先存在。
 # 内容与后面各段自己写的那份**逐字相同**（同路径、同内容，重复写是无害的）。
 # 端到端演示（单次运行证明全链路通）不在这里预取 —— 那一段自己造、自己跑。
+# ⚠️ 必须用 **UTC** 日期，不能用 `date.today()`。
+# 实测 bug（本机 UTC+8，凌晨跑必挂）：CLI 用 `datetime.now(timezone.utc)` 算窗口，
+# 而这里原先用本地日期。本地 2026-10-11 时 UTC 还是 2026-10-10 ——
+# 于是边界日算成 10-08，而 CLI 的窗口起点是 10-07，
+# **「应丢弃」的条目全部落进窗口**，3 条窗口断言在每天 00:00–08:00 稳定误报。
+# 用 UTC 之后两边同源，任何时刻跑都一致。
 import datetime as _dt
-_today = _dt.date.today()
+_today = _dt.datetime.now(_dt.timezone.utc).date()
 _edge = _today - _dt.timedelta(days=3)
 
 (TMP / "acc_extra.json").write_text(json.dumps([
@@ -241,7 +247,11 @@ _edge = _today - _dt.timedelta(days=3)
      "summary": "现场情况令人震惊。"},
 ], ensure_ascii=False), encoding="utf-8")
 
-(TMP / "acc_edge.json").write_text(json.dumps([
+# ⚠️ 预取用的 fixture 必须与 section 11 运行时写的【不同路径】。
+# 实测：section 11 会用**当时的**边界日期重写 acc_edge.json，而预取用的是
+# 同一个命令 + 同一个 extra-json 路径 → 命中缓存 → 回放到旧结果，
+# 3 条窗口断言全挂。换个文件名，键就不同了，两边互不干扰。
+(TMP / "acc_edge_pre.json").write_text(json.dumps([
     {"title": "边界日条目（应当保留）", "source": "澎湃新闻",
      "url": "https://example.com/edge", "date": _edge.isoformat(),
      "summary": "2026年10月7日，某机构发布通告，涉及3项数据与2家单位。"},
@@ -253,7 +263,13 @@ _edge = _today - _dt.timedelta(days=3)
      "summary": "datetime 判据会放过它，日期判据必须丢弃。"},
 ], ensure_ascii=False), encoding="utf-8")
 
-# ★ 并发预取全部 15 条唯一命令。实测这些命令**零重复**，
+# ★ 并发预取唯一命令。
+# ⚠️ **不要预取依赖运行时 fixture 的命令**（如 section 11 的窗口边界用例）——
+# 它的 extra-json 是那一刻才写出来的，而 `_norm` 剔掉了 `--extra-json`/`--out`
+# 这类路径参数，所以预取的旧结果会被回放、断言全挂（实测踩过）。
+# 那条命令留在原地真跑，是正确的代价。
+#
+# ★ 并发预取唯一命令。实测这些命令**零重复**，
 #   串行要 215s，并发后墙钟 ≈ 最慢的那条（~19s）。
 _prewarm([
     ("--domain", "social", "--class", "social", "--days", "3", "--max-per-source", "5",
@@ -277,9 +293,6 @@ _prewarm([
      "--request", "AI界这几天有什么进展", "--out", str(TMP / "acc_trendish.json")),
     ("--domain", "ai", "--class", "social", "--days", "3", "--max-per-source", "8",
      "--compact", "--out", str(TMP / "acc_hotcap.json")),
-    ("--domain", "social", "--class", "social", "--days", "3",
-     "--extra-json", str(TMP / "acc_edge.json"), "--max-per-source", "3",
-     "--out", str(TMP / "acc_edge_out.json")),
     ("--domain", "science", "--class", "authority", "--days", "3", "--max-per-source", "5",
      "--compact", "--out", str(TMP / "acc_zero.json")),
     ("--domain", "ai", "--class", "authority", "--days", "3", "--max-per-source", "15",
@@ -312,6 +325,8 @@ _prewarm([
      "--out", str(TMP / "acc_out.json")),
     ("--domain", "ai", "--class", "social", "--days", "3", "--max-per-source", "8",
      "--compact", "--out", str(TMP / "acc_compact.json")),
+    ("--domain", "social", "--days", "3", "--max-per-source", "30",
+     "--compact", "--out", str(TMP / "acc_fp.json")),
 ])
 
 # ---------------------------------------------------------------------------
@@ -755,8 +770,14 @@ print("\n[11] 窗口粒度 · 边界日必须在内（本轮最大改动，之�
 # 原来的 bug：主窗口用 `dt >= since`（datetime 粒度），而 Crossref 只给日期
 # 粒度（一律 T00:00:00Z），于是窗口首日的每一条都被判「窗口外」。
 # 这里造边界日与前一天各一条，断言「前一天丢、当天留」。
+# ⚠️ 必须用 **UTC** 日期，不能用 `date.today()`。
+# 实测 bug（本机 UTC+8，凌晨跑必挂）：CLI 用 `datetime.now(timezone.utc)` 算窗口，
+# 而这里原先用本地日期。本地 2026-10-11 时 UTC 还是 2026-10-10 ——
+# 于是边界日算成 10-08，而 CLI 的窗口起点是 10-07，
+# **「应丢弃」的条目全部落进窗口**，3 条窗口断言在每天 00:00–08:00 稳定误报。
+# 用 UTC 之后两边同源，任何时刻跑都一致。
 import datetime as _dt
-_today = _dt.date.today()
+_today = _dt.datetime.now(_dt.timezone.utc).date()
 _edge = _today - _dt.timedelta(days=3)        # --days 3 的窗口起点（日期粒度）
 _json_edge = TMP / "acc_edge.json"
 _json_edge.write_text(json.dumps([
@@ -1079,6 +1100,41 @@ check("外媒中文站的 note 都写明了立场属性",
 _ai_social = [k for k, v in ff.SOURCES.items()
               if "ai" in v.get("domains", []) and v.get("class") == "social"]
 check("ai 域可取到的社交源 ≥12（扩充前为 6）", len(_ai_social) >= 12, True)
+
+print("\n[17] 稳定性 · 同分条目不得由摄入顺序决定 + 内容指纹")
+# 实测稳定性 bug：排序键原来只有 `(truth_score, comm_score)`。同一个源里
+# 大量条目**分数完全相同**（实测 chinanews 一次 162 条全是 0.53/0.30），
+# 而 Python 的 sort 是稳定的 → 同分条目保持**摄入顺序**。
+# 摄入顺序取决于哪个 feed 先返回、as_completed 谁先完成，**每次都可能不同**。
+# 后果：从 162 条里 cap 30 条时，**挑中哪 30 条是不确定的** ——
+# 同一份数据、同一套参数，两次跑出的报告内容不一样。
+#
+# 加重排序键（发布时间 + 标题）之后必须有全序。
+_v = [{"truth_score": 0.5, "comm_score": 0.3, "published": "2026-10-10T10:00",
+       "title": "A"},
+      {"truth_score": 0.5, "comm_score": 0.3, "published": "2026-10-10T10:00",
+       "title": "B"},
+      {"truth_score": 0.5, "comm_score": 0.3, "published": "2026-10-10T09:00",
+       "title": "C"}]
+_k = lambda e: (e["truth_score"], e["comm_score"],
+                str(e.get("published") or ""), str(e.get("title") or ""))
+check("同分同时间的条目有确定全序（标题兜底）",
+      sorted(_v, key=_k, reverse=True) == sorted(_v, key=_k, reverse=True), True)
+check("同分时更新的优先", sorted(_v, key=_k, reverse=True)[0]["title"] in ("A", "B"), True)
+check("排序键覆盖 4 个字段（不是只按分数）", len(_k(_v[0])), 4)
+
+# 内容指纹：让「内容变了」可归因
+_fp = TMP / "acc_fp.json"
+_rfp, _ = run("--domain", "social", "--days", "3", "--max-per-source", "30",
+              "--compact", "--out", str(_fp))
+if _rfp == 0 and _fp.exists():
+    _dfp = load(_fp)["stats"]
+    check("stats 里有 content_fingerprint", bool(_dfp.get("content_fingerprint")), True)
+    check("指纹是 16 位十六进制", len(_dfp.get("content_fingerprint") or ""), 16)
+    check("volatile_sources 已列出（实时源，不是缺陷）",
+          "toutiao-hot" in (_dfp.get("volatile_sources") or []), True)
+else:
+    check("指纹用例运行成功", False, True)
 
 print("\n[9] 回归 · 已有两套测试仍通过")
 print(f"  （缓存命中 {_HITS[0]} / 未命中 {_HITS[1]} —— 未命中会真的再抓一次）")
