@@ -775,7 +775,7 @@ def parse_feed(payload: bytes, label: str, link_prefer: str = "alternate") -> li
             "published_raw": published,
             "published": (_parse_date(published).isoformat() if _parse_date(published) else None),
             "summary": _sum_clipped,
-            "summary_truncated": len(_sum_raw) > len(_sum_clipped),
+            "summary_truncated": _is_clipped(_sum_raw),
             "authors": [a for a in authors if a][:4],
             "source_label": label,
         })
@@ -793,11 +793,18 @@ def fetch_rss(url: str, label: str, ua: str | None = None,
 
 def fetch_atom_arxiv(spec: dict, n: int) -> list[dict]:
     out: list[dict] = []
+    # ★ 必须把 spec 上的 per-source timeout 传下去。
+    # 实测 bug：这里曾经是 `_get(url, retries=2)`，不传 timeout → 回落全局 25s。
+    # 而 `set_source_timeouts()` 特意给 arxiv-ai 设了 40s（因为它在 4 个分类下
+    # 耗时 ≈ 9.4 + 3×3 = 18.4s，25s 余量太小会截断合法分类数据）。
+    # 结果那个 40s 只作用在 arxiv-rss-ai（kind=="rss"）上 —— 而周末它是空 feed。
+    # 被论证要放宽的那个源，从来没吃到过这个值。
+    tmo = spec.get("timeout")
     for index, cat in enumerate(spec.get("cats", [])):
         if index:
             time.sleep(ARXIV_GAP)          # arXiv 429s on back-to-back calls
         url = spec["url"].format(cat=cat, n=n)
-        for entry in parse_feed(_get(url, retries=2), f"{spec['label']} · {cat}"):
+        for entry in parse_feed(_get(url, retries=2, timeout=tmo), f"{spec['label']} · {cat}"):
             entry["category"] = cat
             out.append(entry)
     return out
@@ -894,7 +901,12 @@ def fetch_toutiao_hot(spec: dict, n: int) -> list[dict]:
     return out
 
 
-def _clip(text: str, head: int = 1400, tail: int = 500) -> str:
+_CLIP_HEAD = 1400
+_CLIP_TAIL = 500
+_CLIP_LIMIT = _CLIP_HEAD + _CLIP_TAIL          # 1900：超过它 _clip 才会动手
+
+
+def _clip(text: str, head: int = _CLIP_HEAD, tail: int = _CLIP_TAIL) -> str:
     """Trim a long abstract WITHOUT discarding its conclusion.
 
     Measured loss from a plain [:900] slice: 43 of 162 summaries were cut exactly
@@ -910,6 +922,20 @@ def _clip(text: str, head: int = 1400, tail: int = 500) -> str:
         return text
     omitted = len(text) - head - tail
     return f"{text[:head]} …[省略 {omitted} 字]… {text[-tail:]}"
+
+
+def _is_clipped(text: str) -> bool:
+    """Was this text long enough that _clip() replaced part of it?
+
+    ★ 判据必须是【内容长度 > _CLIP_LIMIT】，不能是 `len(raw) > len(clipped)`。
+    实测 off-by-N：`_clip` 插入的 `…[省略 N 字]…` 标记【让结果变长】，
+    所以 raw ∈ [1901, 1913] 时 clipped 反而比 raw 长 ——
+    `len(raw) > len(clipped)` 为 False，被截过的条目被报成「没截断」。
+    而 Crossref 路径当时用的是 `len(abstract) > 1900`（正确），
+    RSS 路径用的是长度比较（错误）—— **同一个动作两条路径两套判据**，
+    于是 full JSON 说「没截断」、compact 说「截断了」，两者对同一条给出相反答案。
+    """
+    return len(text or "") > _CLIP_LIMIT
 
 
 def fetch_crossref(spec: dict, n: int, since: datetime) -> list[dict]:
@@ -964,7 +990,7 @@ def fetch_crossref(spec: dict, n: int, since: datetime) -> list[dict]:
             "published_raw": dt.date().isoformat() if dt else None,
             "published": dt.isoformat() if dt else None,
             "summary": _clip(abstract),
-            "summary_truncated": len(abstract) > 1900,
+            "summary_truncated": _is_clipped(abstract),
             "authors": [a for a in authors if a][:4],
             "doi": item.get("DOI"),
             "type": item.get("type"),
@@ -1050,7 +1076,13 @@ OUTLET_ALIAS: tuple[tuple[str, str], ...] = (
     ("央视", "cctv"), ("cctv", "cctv"), ("新闻联播", "cctv"),
     # 新华社系统：一个通讯社
     ("新华社", "xinhua"), ("新华网", "xinhua"), ("新华每日电讯", "xinhua"),
-    ("中新社", "xinhua"), ("中国新闻网", "xinhua"), ("中新网", "xinhua"),
+    # 中新社系统：**另一家**通讯社。实测教训：第一版把中新社/中国新闻网/中新网
+    # 也映射到 `xinhua`，于是「新华社」和「中新社」被判同一家 —— 而这恰恰是
+    # 本函数 docstring 自己举的原始反例，即【过合并原封未动】。
+    # 更糟的是当时的测试断言写的是 `中新社 == 中国新闻网 → 'xinhua'`，
+    # 把错误固化成期望值，两个方向的断言都抓不到它。
+    # 中新社与新华社是两家独立通讯社，必须分开。
+    ("中新社", "chinanews"), ("中国新闻网", "chinanews"), ("中新网", "chinanews"),
     # 人民日报社：一张报纸及其网站
     ("人民日报", "people"), ("人民网", "people"),
     # 央广/国际台
@@ -1903,8 +1935,15 @@ def keyword_coverage(keywords: list[str], entries: list[dict],
     count as coverage or the gate never fires.
     """
     if not keywords:
-        return {"coverage": 1.0, "keywords": [], "missing": [], "matched": [],
-                "note": "未提供关键词，跳过关联度检查", "entries_checked": 0}
+        # ★ 不能返回 coverage=1.0。实测问题：没有关键词时这里给 1.0，控制台就打
+        # 「关联度 1.0 / 阈值 0.6 [OK]」—— 而 `entries_checked` 是 0，闸门根本
+        # 没跑。这正是本文件自己警告过的那件事：
+        #   "a gate that silently passes everything is worse than no gate,
+        #    because the report still claims it checked."
+        # 没有可量的东西就说「没量」，不要报一个满分。
+        return {"coverage": None, "checked": False, "keywords": [], "missing": [],
+                "matched": [], "entries_checked": 0,
+                "note": "未提供关键词，关联度【未检查】—— 不要把它读成通过"}
 
     def haystack(e: dict) -> str:
         parts = [e.get("title") or "", e.get("summary") or "",
@@ -1952,17 +1991,26 @@ def compact_view(result: dict, summary_chars: int = 600) -> dict:
             "passes_truth", "passes_comm", "passes_gate",
             "also_seen_in", "corroborated_by",
             "promotional_signal", "promo_body_hit", "promo_note",
-            "trend_capped", "body_missing", "body_note",
-            "record_alert", "retraction", "front_matter", "front_matter_reason",
+            "trend_capped", "trend_rank", "trend_heat", "body_missing", "body_note",
+            "record_alert", "front_matter", "front_matter_reason",
+            "abstract_missing", "update_notices", "related_news",
             "doi", "is_trend", "signal_words", "elements", "in_window",
-            "update_notices")
-    # 值为 False / 0 也必须保留的键。实测：省略逻辑用 falsy 通杀，于是
+            "trend_no_date", "mirror", "type", "container_title")
+    # 值为 False / 0 / 空列表 也必须保留的键。实测：省略逻辑用 falsy 通杀，于是
     # `promotional_signal: false` 被删掉 —— 230 条全部评估过、compact 里 0 条保留，
     # 下游**无法区分「检查过、没有导购信号」和「根本没做这项检查」**。
     # 「缺省」和「否」在判断上是两件事，不能合并。
+    #
+    # `update_notices` / `record_alert`：撤稿与更正通道。它们【在 keep 里但曾被
+    # falsy 规则剔除】，因为空列表 `[]` 是 falsy —— 于是「查过、无撤稿声明」
+    # 在 compact 里变成「这个字段不存在」，下游分不清「干净」和「没查」。
+    # 撤稿拦截是这个 skill 的卖点之一，它的**阴性结果**同样必须可见。
+    #
+    # 注：`retraction` 已从 keep 移除 —— 全文件没有任何赋值处，是死键。
     KEEP_WHEN_FALSY = {"promotional_signal", "promo_body_hit", "trend_capped",
                        "body_missing", "passes_truth", "passes_comm", "passes_gate",
-                       "in_window", "is_trend"}
+                       "in_window", "is_trend", "update_notices", "record_alert",
+                       "front_matter", "abstract_missing"}
     out_entries = []
     for e in result.get("entries", []):
         r = {}
@@ -1981,16 +2029,29 @@ def compact_view(result: dict, summary_chars: int = 600) -> dict:
             if k not in e:
                 continue
             v = e[k]
+            # `in_window` 有三态：True（在窗内）/ False（窗外）/ **None（无日期）**。
+            # None 必须保留 —— 它是「这条没日期」这个**已知事实**，
+            # 与「键不存在」不是一回事。趋势榜 37 条就是这样：
+            # 无日期、被窗口豁免，若把 None 当空值删掉，读者会看到
+            # `in_window` 键整个消失，只能猜。判据用 `is False` 而不是 falsy。
+            if k == "in_window" and v is None:
+                r[k] = None
+                continue
             if v in (None, "", [], {}) or (v is False and k not in KEEP_WHEN_FALSY):
                 continue                      # 省略空值，省的是 token
             r[k] = v
-        # evidence_form 是现算的，必须在这里补上：社交域公式
-        # 真实 = 0.30×平台 + 0.70×证据形式，70% 那一项不写下来，下游无法复核，
-        # 却还留着 reconciliation="social-evidence-form" 明示它参与了。
-        try:
-            r["evidence_form"] = evidence_form_of(e)
-        except Exception:
-            pass
+        # ★ `evidence_form` 只在【它参与打分】时才出现在全量里，而且趋势条目上
+        # 有一个特殊值 `trend-board(unverifiable)`（由 apply_trend_cap 写入）。
+        # 第一版这里无条件 `r["evidence_form"] = evidence_form_of(e)`，两个后果：
+        #   ① 把趋势条目的 `trend-board(unverifiable)` 覆盖成 `first-hand-report`
+        #      —— 实测 52/52 全部矛盾，**热搜标题在下游唯一那份文件里被标成
+        #      「一手报道」**，直接违反 quality-bar「热度榜不作事实依据」；
+        #   ② 给权威面条目凭空补算一个它打分时【根本没用到】的量，
+        #      一条 Nature 论文会带 `unattributed`，读者可能把「文本没抽到实体锚点」
+        #      误读成「这篇不可信」。
+        # 正确做法：全量有就照抄，全量没有就不写。
+        if "evidence_form" in e:
+            r["evidence_form"] = e["evidence_form"]
         s = e.get("summary") or ""
         # ★ 先记下「入库摘要全长」和「它本身是否已被 _clip 截过」。
         # 实测双重截断陷阱：`_clip()` 的 `…[省略 N 字]…` 标记固定在【第 1401 字】，
@@ -2343,10 +2404,16 @@ def main() -> int:
             if not isinstance(it, dict) or not (it.get("title") or "").strip():
                 continue
             pub = it.get("date") or it.get("published")
+            # 走 _clip 而不是 [:900] 硬切。实测问题：注入路径曾是 `[:900]`，
+            # **既不插省略标记也不设 summary_truncated** —— 静默截断，正是
+            # 「双重截断不可见」要消灭的那一类。改成与 RSS/Crossref 同一条路径，
+            # 于是三种来源的截断行为与记账完全一致。
+            _x_raw = _strip_html(it.get("summary") or it.get("claim") or "")
             entry = {
                 "title": _strip_html(it.get("title") or ""),
                 "url": it.get("url"),
-                "summary": _strip_html(it.get("summary") or it.get("claim") or "")[:900],
+                "summary": _clip(_x_raw),
+                "summary_truncated": _is_clipped(_x_raw),
                 "authors": it.get("authors") or [],
                 "source_label": it.get("source") or it.get("source_label") or "补充检索",
                 "source_key": it.get("source_key") or "",
@@ -2558,12 +2625,17 @@ def main() -> int:
 
         # 无正文 → 真值分压到闸门下。实测：`summary` = "Comments" 的 6 字符条目拿到
         # 与 1900 字符摘要同等的分；16 条空摘要条目过了真值闸门。没有正文就没有
-        # 可核验的主张，真值分不该过闸 —— 但这【不是丢弃】，仍进待观察区供人看。
+        # 可核验的主张，真值分不该过闸。
+        # ⚠️ 文案必须与实际一致。第一版写「保留在待观察区」「压到 0.50 以下」，
+        # 实测两条都不对：36 条 body_missing **100% 落在 section=丢弃**
+        # （0.50 仍低于 0.6 闸门），且分值恒为 **0.500**（min 的结果不是"以下"）。
+        # 一条自称"保留在待观察区"的注释，会让下游以为还能引用它。
         if body_missing(entry) and not entry.get("trend_capped"):
             entry["body_missing"] = True
             entry["truth_score"] = min(entry["truth_score"], 0.50)
-            entry["body_note"] = ("无可核验正文（摘要为空或占位符）→ 真值分压到 0.50 以下，"
-                                  "保留在待观察区，不作事实依据")
+            entry["body_note"] = ("无可核验正文（摘要为空或占位符）→ 真值分封顶 0.50，"
+                                  "低于 0.6 闸门，因此落在【丢弃】区，不作事实依据；"
+                                  "条目本身仍保留在 JSON 里可查")
 
         entry["pickups"] = pickups
         entry["trend_boards"] = trend_saturation(entry)
@@ -2955,14 +3027,21 @@ def main() -> int:
         adv = rel.get("keyword_advisory") or {}
         kws_shown = rel.get("keywords") or adv.get("keywords") or []
         missing_shown = rel.get("missing") or adv.get("missing") or []
-        flag = "⚠ 需二次搜寻" if rel.get("needs_second_pass") else "OK"
-        print(f"  关联度       : {rel.get('coverage')} / 阈值 {rel.get('threshold')}  "
-              f"[{flag}]  模式={rel.get('mode')}")
-        if kws_shown:
-            print(f"    关键词    : {', '.join(kws_shown)}"
-                  + ("（仅供参考，不参与判定）" if adv else ""))
-        if missing_shown:
-            print(f"    未覆盖    : {', '.join(missing_shown)}")
+        # 没量过就说没量过。曾经这里无条件打印 `coverage / 阈值 [OK]`，
+        # 而没有关键词时 coverage 是伪 1.0、entries_checked 是 0 —— 输出宣称
+        # 「关联度检查通过」，实际一个字都没检查。
+        if rel.get("checked") is False or rel.get("coverage") is None:
+            print(f"  关联度       : 未检查（无关键词可量）  模式={rel.get('mode')}")
+            print(f"    说明      : {rel.get('note','')}")
+        else:
+            flag = "⚠ 需二次搜寻" if rel.get("needs_second_pass") else "OK"
+            print(f"  关联度       : {rel.get('coverage')} / 阈值 {rel.get('threshold')}  "
+                  f"[{flag}]  模式={rel.get('mode')}")
+            if kws_shown:
+                print(f"    关键词    : {', '.join(kws_shown)}"
+                      + ("（仅供参考，不参与判定）" if adv else ""))
+            if missing_shown:
+                print(f"    未覆盖    : {', '.join(missing_shown)}")
         if retracted_count:
             print(f"  ★ 撤稿拦截   : {retracted_count} 条已被撤稿，已作废并压入存疑区")
         promo_n = sum(1 for e in capped if e.get("promotional_signal"))

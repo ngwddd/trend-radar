@@ -301,7 +301,19 @@ check("事件ID：不同事件仍不同",
       ff.event_id("广西贵港闪爆事故2名失联人员确认已无生命体征")
       != ff.event_id("OpenAI releases a new reasoning model"), True)
 check("实体归一：央视新闻 = 央视网", ff.entity_id("央视新闻"), ff.entity_id("央视网"))
-check("实体归一：中新社 = 中国新闻网", ff.entity_id("中新社"), ff.entity_id("中国新闻网"))
+# ★ 中新社【不等于】新华社 —— 这是两家独立通讯社。
+# 这里曾经写 `ff.entity_id("中新社") == ff.entity_id("中国新闻网")`，而当时
+# identity_of 把 中新社/中国新闻网/中新网 全映射到 `xinhua`，于是这条断言
+# 「通过」了 —— 它通过是因为中新社被塞进了新华社的桶，不是因为它有了自己的身份。
+# 把错误固化成期望值，比没有断言更糟：两个方向的测试都因此抓不到过合并。
+check("实体归一：中新社 = 中国新闻网（同一家）",
+      ff.entity_id("中新社") != ff.entity_id("新华社"), True)
+check("实体归一：中新社有自己的身份（不并进新华社）",
+      ff.entity_id("中新社"), "chinanews")
+check("实体归一：中新社旗下三种写法一致",
+      len({ff.entity_id(x) for x in ("中新社", "中国新闻网", "中新网")}), 1)
+check("实体归一：新华社旗下三种写法一致",
+      len({ff.entity_id(x) for x in ("新华社", "新华网", "新华每日电讯")}), 1)
 # ★ 下面这组是子代理指出「79/0 不能当上线依据」之后补的。
 # 原来只有「应合并」断言，所以一个方向相反的过归一 bug 完全隐形：
 # identity_of 曾返回 platform_of() 的结果，而那是【权重桶】——
@@ -423,8 +435,17 @@ if rc == 0 and comp_path.exists():
     ck_all = set()
     for e in cf["entries"]:
         ck_all |= set(e.keys())
-    for key in ("section", "truth_score", "comm_score", "event_id", "evidence_form"):
+    # 这些字段【每条都该有】—— 由所有打分路径无条件写入。
+    # `evidence_form` 不在这个列表里：它**只在参与打分时**才存在
+    # （社交域 truth_weight_social / external_truth_weight 写它，
+    #  权威面 truth_weight 从不写）。要求「每条都有」是把两种语义混了 ——
+    # 而更早一版为了满足这条断言，在 compact_view 里无条件重算它，
+    # 结果把热度榜的 `trend-board(unverifiable)` 覆盖成 `first-hand-report`。
+    for key in ("section", "truth_score", "comm_score", "event_id"):
         check(f"compact 每条都有 {key}", all(key in e for e in cc["entries"]), True)
+    check("compact 的 evidence_form 与全量逐条一致（不得重算覆盖）",
+          {e["title"]: e.get("evidence_form") for e in cc["entries"]},
+          {e["title"]: e.get("evidence_form") for e in cf["entries"]})
     for key, n in full_eval.items():
         check(f"compact 保留 {key}（全量有 {n} 条，值为 falsy 也要留）",
               sum(1 for e in cc["entries"] if key in e), n)
@@ -435,8 +456,16 @@ if rc == 0 and comp_path.exists():
     stray = [k for e in cc["entries"] for k in e
              if k not in ck_all and k not in derived]
     check("compact 不凭空造键（幽灵 null 回归）", stray, [])
-    check("compact 里没有 null 值字段",
-          sum(1 for e in cc["entries"] for v in e.values() if v is None), 0)
+    # `in_window` 是唯一允许为 null 的字段：三态 True/False/None，
+    # 而 None = 「这条没有日期」这个【已知事实】，与「键不存在」不是一回事。
+    # 趋势榜 37 条就是这样（无日期、被窗口豁免）。
+    tri_state = {"in_window"}
+    bad_null = [k for e in cc["entries"] for k, v in e.items()
+                if v is None and k not in tri_state]
+    check("compact 里除 in_window 外无 null 值字段", bad_null, [])
+    check("compact 保留 in_window=None（无日期是已知事实，不是缺省）",
+          all("in_window" in e for e in cc["entries"]
+              if e.get("in_window") is None), True)
     check("compact 保留覆盖情况（degraded_streams / source_funnel / sources_report）",
           all(k in cc for k in ("degraded_streams", "source_funnel", "sources_report")), True)
     # 摘要截断必须标出处，否则下游会以为拿到全文
@@ -461,6 +490,43 @@ if rc == 0 and comp_path.exists():
               for e in cc["entries"]), True)
 else:
     check("精简视图用例运行成功", False, True)
+
+print("\n[11] 窗口粒度 · 边界日必须在内（本轮最大改动，之前零覆盖）")
+# 三个独立复核代理都指出：窗口是这轮最大的改动，但 test_routing 里
+# grep `since|window|dropped|\.date\(\)` **0 匹配** —— 没有护栏。
+# 原来的 bug：主窗口用 `dt >= since`（datetime 粒度），而 Crossref 只给日期
+# 粒度（一律 T00:00:00Z），于是窗口首日的每一条都被判「窗口外」。
+# 这里造边界日与前一天各一条，断言「前一天丢、当天留」。
+import datetime as _dt
+_today = _dt.date.today()
+_edge = _today - _dt.timedelta(days=3)        # --days 3 的窗口起点（日期粒度）
+_json_edge = TMP / "acc_edge.json"
+_json_edge.write_text(json.dumps([
+    {"title": "边界日条目（应当保留）", "source": "澎湃新闻",
+     "url": "https://example.com/edge", "date": _edge.isoformat(),
+     "summary": "2026年10月7日，某机构发布通告，涉及3项数据与2家单位。"},
+    {"title": "窗口前一天条目（应当丢弃）", "source": "澎湃新闻",
+     "url": "https://example.com/before", "date": (_edge - _dt.timedelta(days=1)).isoformat(),
+     "summary": "该条目早于窗口起点，必须被丢弃。"},
+    {"title": "边界日前夜 23:59（应当丢弃）", "source": "澎湃新闻",
+     "url": "https://example.com/midnight", "date": (_edge - _dt.timedelta(days=1)).isoformat(),
+     "summary": "datetime 判据会放过它，日期判据必须丢弃。"},
+], ensure_ascii=False), encoding="utf-8")
+_edge_out = TMP / "acc_edge_out.json"
+rc, _ = run("--domain", "social", "--class", "social", "--days", "3",
+            "--extra-json", str(_json_edge), "--max-per-source", "3",
+            "--out", str(_edge_out))
+if rc == 0 and _edge_out.exists():
+    de = load(_edge_out)
+    titles = [e.get("title") or "" for e in de["entries"]]
+    check("窗口边界日条目被保留", any("边界日条目" in t for t in titles), True)
+    check("窗口前一天条目被丢弃", any("前一天条目" in t for t in titles), False)
+    check("边界日前夜条目被丢弃（datetime 判据会放过它）",
+          any("前夜" in t for t in titles), False)
+    check("external_dropped_out_of_window 计到 2 条",
+          de["stats"].get("external_dropped_out_of_window"), 2)
+else:
+    check("窗口粒度用例运行成功", False, True)
 
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):
