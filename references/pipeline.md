@@ -95,6 +95,36 @@
 Crossref 按「出版日期」排会漏掉大刊全部新文章（它们的期号日期滞后数月），
 脚本已改用 `published-online`。
 
+### 本周重大事件：`--major-days N`
+
+**用途**：诺奖这类**领域级事件**常在窗口外一两天宣布。实测化学奖 **10-07** 宣布，
+而窗口是 10-08~10-10 —— 按窗口纪律只能**整条丢掉**，但它是那一周最大的科学事件。
+
+```powershell
+# 基础窗口仍 3 天，但重大源放宽到 7 天
+python scripts/fetch_feeds.py --domain science --class authority \
+  --days 3 --major-days 7 --compact --out "$env:TEMP\radar_auth.json"
+```
+
+**三条硬约束**（每一条都对应一次实测翻车）：
+
+1. **只对重大源生效** —— 证据类型为 `peer-reviewed` / `official`，
+   或由 `--extra-json` 显式标 `major_event: true`。
+   **聚合器（ScienceDaily / Phys.org 那类）不享受** ——
+   实测「机构稿 09-28 → ScienceDaily 10-09 才转发」正是这个问题的来源，
+   让聚合器也拿宽窗口等于**奖励慢转载**。
+2. **放宽的是查询，收紧的仍是过滤器**。实测：只改 Python 侧过滤器时
+   `--major-days 7` 与 `--major-days 0` 输出**完全相同** ——
+   因为 Crossref 的 API 请求自带 `from-online-pub-date:<since>`，
+   窗口外的记录压根没抓回来。**查询和过滤必须一起改。**
+3. **进来的条目强制打标**：`major_window: true` + `in_window: false` +
+   `major_window_note`。控制台也会报「★ 重大事件窗口: N 条落在近 3 天之外」。
+
+> **⚠️ 引用时必须写明它不在基础时间窗内。** 静默放宽窗口比漏报更糟 ——
+> 所以 `in_window` 如实为 `false`，不粉饰。
+
+**默认关闭**（`--major-days 0`），不改变任何既有行为。
+
 **输出**：参数卡（分类 + 时间窗 + 条数 + 关注点）
 
 ---

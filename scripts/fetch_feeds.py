@@ -162,7 +162,6 @@ SOURCE_WEIGHT = {
     # 想让单源直接过闸就得把权重抬到 0.90 一档，那是拿打分迁就结果，不做。
     "chinanews":           0.50,
     # -- trend boards: popularity signal, NOT a credibility signal --
-    "baidu-hot":           0.35,
     "toutiao-hot":         0.35,
     "google-trends-us":    0.35,
 }
@@ -565,28 +564,6 @@ SOURCES: dict[str, dict] = {
     # ---- 热度榜：主窗口在等待两个子代理时抓这一路 ----
     # These are the ONLY sources ranked by POPULARITY rather than recency.
     # Popularity is not importance -- treat as 风向, never as 事实.
-    "baidu-hot": {
-        "kind": "baidu_hot",
-        "group": "trend",
-        "domains": ["social"],
-        "class": "trend",
-        # RSSHub public mirrors are unstable individually; try each in order.
-        "urls": [
-            "https://rsshub.rssforever.com/baidu/top",
-            "https://rsshub.app/baidu/top",
-            "https://rss.shab.fun/baidu/top",
-            "https://rsshub.feeded.xyz/baidu/top",
-        ],
-        "label": "百度热搜 (via RSSHub mirror)",
-        "status": "OK",
-        # 并发竞速 + 每镜像 10s 上限。实测：串行时最坏 4×(3×25+2+4)=324s，
-        # 而且确实出现过一次 94s 全挂；并行后实测 0.6s（拿到 51 条）。
-        # 热度榜是「有就有、没有就算了」的校准信号，不值得为它等 25 秒。
-        "mirror_timeout": 10,
-        "note": ("按热度排序；公众面最广的中文热度榜。4 个镜像【并发竞速】，"
-                 "每个 10s 上限，先拿到非空结果的胜出。实测 4 个里常态化 3 个已死"
-                 "（1 个 403、2 个 DNS 失败），所以并发是必需的，不是优化"),
-    },
     "toutiao-hot": {
         "kind": "toutiao_hot",
         "group": "trend",
@@ -877,6 +854,33 @@ def fetch_atom_arxiv(spec: dict, n: int) -> list[dict]:
     return out
 
 
+def _is_major_source(entry: dict) -> bool:
+    """这条能不能享受「本周重大事件」宽窗口。
+
+    判据刻意收窄到【领域级事件通常的发布形态】：
+      ① `major_event: true` —— 由 `--extra-json` 显式标注（调用方最清楚
+         哪条是诺奖这种级别，脚本不该猜）；
+      ② 证据类型是 `peer-reviewed` / `official` —— 期刊与官方一手发布。
+
+    **为什么聚合器不享受宽窗口**：实测「机构稿 09-28 → ScienceDaily 10-09
+    才转发」正是这个问题的来源。让聚合器也拿宽窗口，等于奖励慢转载，
+    还让「近 3 天」这个承诺悄悄失效。宽窗口只给**真正在该日发布的人**。
+
+    ⚠️ 必须在这里**现算** evidence_type，不能读 `entry["evidence_type"]` ——
+    那个字段在打分循环里才赋值，而窗口过滤发生在它**之前**。
+    实测：读字段的版本让 `--major-days 7` 一条都放不进来
+    （查询确实多抓回 7 条，但过滤器读到的全是 None）。
+    `evidence_type_for` 是纯函数、幂等，算两次没有副作用。
+    """
+    if entry.get("major_event"):
+        return True
+    ev = entry.get("evidence_type")
+    if not ev:
+        key = entry.get("source_key", "")
+        ev = evidence_type_for(key, SOURCES.get(key, {}).get("class", ""), entry)
+    return ev in HARD_EVIDENCE_TYPES | {"official"}
+
+
 def fetch_rss_multi(urls: list[str], label: str, ua: str | None = None,
                     link_prefer: str = "alternate",
                     timeout: int | None = None) -> tuple[list[dict], list[str]]:
@@ -926,7 +930,8 @@ def fetch_rss_multi(urls: list[str], label: str, ua: str | None = None,
 def _mirror_fetch(spec: dict, label: str) -> list[dict]:
     """Fetch a mirrored source by RACING the mirrors concurrently.
 
-    为什么必须并行：实测 `baidu-hot` 配了 4 个镜像，其中 3 个已死
+    为什么必须并行：实测 `baidu-hot`（已于 2026-10-10 下架）配了 4 个镜像，
+    其中 3 个已死
     （1 个 403、2 个 DNS 失败），而串行 for 循环的**最坏情况是
     4 × (3 次尝试 × TIMEOUT + 退避 2+4) = 4 × 81 = 324 秒**。
     实测确实出现过一次 94 秒的全挂（另一代理记录）。一个热度榜源不该
@@ -937,6 +942,13 @@ def _mirror_fetch(spec: dict, label: str) -> list[dict]:
 
     `spec["mirror_timeout"]` 控制单个镜像的超时（默认 10s）——
     热度榜是「有就有、没有就算了」的校准信号，不值得为它等 25 秒。
+
+    ⚠️ **当前没有调用者**（唯一的 `baidu-hot` 于 2026-10-10 下架），
+    但**故意保留**：
+      ① 它是通用能力 —— 再登记任何带 `urls` 的镜像源立刻就能用；
+      ② 上面那三条实测记录（324s 最坏 / 94s 全挂 / `with` 会 join 全部线程）
+         是踩出来的，删了函数就得连教训一起重写一遍。
+    `--list` 的源计数不会显示它，因为它是机制不是源。
     """
     urls = spec.get("urls") or [spec["url"]]
     per = spec.get("mirror_timeout", 10)
@@ -2014,11 +2026,17 @@ def estimate_pickups(entry: dict, cls: str = "") -> int:
     `also_seen_in` would silently drop that.
 
     TREND BOARDS DO NOT CORROBORATE EACH OTHER. Measured bug this fixes: two
-    hot-search boards (baidu-hot + toutiao-hot) both listing the same celebrity
-    story produced pickups=2 -> comm 0.68 -> the story cleared the gate, which
-    directly contradicts comm_weight's own rule that a trend appearance "is NEVER
-    sufficient alone -- that is how a celebrity name would otherwise pass the
-    gate". Two boards tracking the same search volume is one signal, not two.
+    hot-search boards (baidu-hot + toutiao-hot, 当时两个都在册) both listing the
+    same celebrity story produced pickups=2 -> comm 0.68 -> the story cleared the
+    gate, which directly contradicts comm_weight's own rule that a trend
+    appearance "is NEVER sufficient alone -- that is how a celebrity name would
+    otherwise pass the gate". Two boards tracking the same search volume is one
+    signal, not two.
+
+    ⚠️ `baidu-hot` 已于 2026-10-10 下架（4 个镜像常态 3 个已死；当天 5 次失败
+    只成功 2 次；中文热度面由 `toutiao-hot` 独家覆盖，冗余已够）。
+    但**这条规则必须留着** —— 只要再登记第二个中文热度榜，两榜互证的路径
+    立刻就会被走通。规则的价值不随当时有几个榜单而变。
     """
     if isinstance(entry.get("pickups"), int) and entry["pickups"] > 0:
         return entry["pickups"]
@@ -2421,6 +2439,7 @@ def compact_view(result: dict, summary_chars: int = 600) -> dict:
             "truth_score", "comm_score", "pickups", "section", "gate_note",
             "passes_truth", "passes_comm", "passes_gate",
             "corroborated", "single_source_hard_evidence",
+            "major_window", "major_window_note",
             "also_seen_in", "corroborated_by",
             "promotional_signal", "promo_body_hit", "promo_note",
             "customer_story", "customer_story_note",
@@ -2579,6 +2598,16 @@ def main() -> int:
                     help="三大类之一: social | science | ai. repeatable. "
                          "从用户需求判断出属于哪一类，两路子代理都在这一类内路由")
     ap.add_argument("--days", type=int, default=3, help="time window in days (default 3)")
+    ap.add_argument("--major-days", type=int, default=0,
+                    help="【本周重大事件】把窗口放宽到 N 天，但**只对重大源生效**"
+                         "（期刊 / 官方发布 / 预印本）。默认 0 = 关闭。"
+                         "用途：诺奖这类在窗口外一两天的领域级事件 "
+                         "—— 实测化学奖 10-07 宣布，而窗口是 10-08~10-10，"
+                         "按窗口纪律只能整条丢掉。"
+                         "⚠️ 只有被 --extra-json 显式标注的源会走宽窗口，"
+                         "聚合器（ScienceDaily / Phys.org 那类）**不**享受 —— "
+                         "它们的迟到转载正是这个问题的来源，不是解法。"
+                         "进来的条目带 major_window=True，必须写明「落在基础窗口外」")
     ap.add_argument("--max-per-source", type=int, default=25)
     ap.add_argument("--out", default=None, help="write JSON here (recommended on Windows)")
     ap.add_argument("--compact", action="store_true",
@@ -2746,6 +2775,9 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=args.days)
+    # 必须在这里定义，不能等到窗口过滤那一段 —— fetch 循环（更早）就要用它
+    # 去放宽 Crossref 的**查询**窗口。
+    major_days = max(0, int(getattr(args, "major_days", 0) or 0))
     entries: list[dict] = []
     report: list[dict] = []
     dropped_external = 0
@@ -2788,7 +2820,15 @@ def main() -> int:
             elif spec["kind"] == "atom":
                 got = fetch_atom_arxiv(spec, args.max_per_source)
             elif spec["kind"] == "crossref":
-                got = fetch_crossref(spec, args.max_per_source, since)
+                # ★ 查询窗口必须跟着 --major-days 放宽，否则宽窗口【根本不起作用】。
+                # 实测：只改 Python 侧的过滤器时，`--major-days 7` 与 `--major-days 0`
+                # 输出**完全相同** —— 因为 Crossref 的 API 请求本身就带了
+                # `filter=from-online-pub-date:<since>`，窗口外的记录压根没被抓回来，
+                # 过滤器看不到它们。放宽的是**查询**，收紧的仍是**过滤器**
+                # （见窗口过滤处：进来的条目一律标 major_window 且 in_window=False）。
+                got = fetch_crossref(
+                    spec, args.max_per_source,
+                    since - timedelta(days=max(0, major_days - args.days)))
             elif spec["kind"] == "rss_multi":
                 got, sub_failed = fetch_rss_multi(
                     spec["feeds"], spec["label"], spec.get("ua"),
@@ -2797,8 +2837,6 @@ def main() -> int:
                     # 版面级失败要能看见 —— 否则「4 个版面只成功 1 个」
                     # 会看起来像「这家今天内容少」，是同一类静默陷阱。
                     sub_feed_failures[key] = sub_failed
-            elif spec["kind"] == "baidu_hot":
-                got = _mirror_fetch(spec, spec["label"])
             elif spec["kind"] == "toutiao_hot":
                 got = fetch_toutiao_hot(spec, args.max_per_source)
             elif spec["kind"] == "google_trends":
@@ -2945,6 +2983,7 @@ def main() -> int:
     # 热度榜 (class=trend) is exempt: a hot-search list has no per-item date and
     # is by definition current, so applying the window would wrongly empty it.
     kept, undated, dropped, trend_exempt = [], 0, 0, 0
+    major_kept = 0
     for entry in entries:
         if SOURCES.get(entry.get("source_key", ""), {}).get("class") == "trend":
             entry["in_window"] = True
@@ -2971,6 +3010,25 @@ def main() -> int:
         elif dt.date() >= since.date():
             entry["in_window"] = True
             kept.append(entry)
+        elif (major_days > 0
+              and _is_major_source(entry)
+              and dt.date() >= (since - timedelta(days=major_days - args.days)).date()):
+            # ★ 重大事件宽窗口。**只对重大源生效**，其余一律照旧丢弃。
+            #
+            # 为什么不能全局放宽 --days：那会让聚合器的迟到转载也进来 ——
+            # 而「机构稿 09-28、聚合器 10-09 才转发」正是这个问题的来源。
+            # 把窗口整体放宽等于奖励慢转载，还让「近 3 天」这个承诺失效。
+            #
+            # 为什么不能默默放行：这条路径进来的东西**确实在基础窗口外**。
+            # 所以强制打标，下游必须写明。静默放宽窗口是比漏报更糟的错。
+            entry["in_window"] = False          # 它确实不在基础窗口内，不粉饰
+            entry["major_window"] = True
+            entry["major_window_note"] = (
+                f"★ 落在基础窗口（近 {args.days} 天）之外，"
+                f"经 --major-days {major_days} 作为【本周重大事件】纳入。"
+                f"引用时必须写明它不在基础时间窗内。")
+            kept.append(entry)
+            major_kept += 1
         else:
             entry["_dropped_window"] = True
             dropped += 1
@@ -3532,6 +3590,9 @@ def main() -> int:
             "retracted_total": retracted_count,
             "external_injected": sum(r["count"] for r in report if r["source"] == "extra-json"),
             "external_dropped_out_of_window": dropped_external,
+            # 宽窗口纳入数。与 dropped_out_of_window 并列 —— 它描述的是同一件事
+            # 的另一个方向（放行而非丢弃），放在顶层会被读 stats 的下游漏掉。
+            "major_events_kept": major_kept,
         },
         "weights": {
             "source_weight": SOURCE_WEIGHT,
@@ -3594,8 +3655,14 @@ def main() -> int:
         # 而 JSON 里 `external_dropped_out_of_window` 是 3 —— 控制台与 JSON 对
         # 同一件事给出不同答案，读控制台的人会以为一条没丢。
         _ext_drop = result["stats"].get("external_dropped_out_of_window") or 0
+        _mj = result["stats"].get("major_events_kept") or 0
         print(f"  entries      : {result['stats']['kept']} kept / {result['stats']['raw']} raw "
               f"({dropped} out-of-window"
+              # ★ 宽窗口纳入的数必须与 dropped 一起报。实测：控制台显示
+              # `0 out-of-window` 而实际有 7 条是窗口外的 —— 因为它们走的是
+              # 「宽窗口放行」路径，不增加 dropped。不报出来就成了反向的
+              # 静默放宽：读控制台的人会以为这 7 条本来就在窗口内。
+              + (f", {_mj} 条由 --major-days 从窗口外纳入" if _mj else "")
               + (f" + {_ext_drop} external out-of-window" if _ext_drop else "")
               + f", {undated} undated, "
               f"{result['stats']['duplicates_merged']} duplicates merged, "
@@ -3642,6 +3709,9 @@ def main() -> int:
                       f"本条覆盖【不完整】")
                 for f_ in fails:
                     print(f"        - {f_}")
+        if major_kept:
+            print(f"  ★ 重大事件窗口: {major_kept} 条落在近 {args.days} 天之外，"
+                  f"由 --major-days {args.major_days} 纳入 —— **引用时必须写明**")
         if degraded:
             print("  ★ 降级告警   :")
             for d in degraded:

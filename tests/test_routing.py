@@ -730,6 +730,55 @@ if "chinanews" in ff.SOURCES:
 # hnrss 已下架（抓 20 条全部并入 hn-frontpage，落地 0，两次运行都是）
 check("hnrss 已从注册表移除", "hnrss" in ff.SOURCES, False)
 
+print("\n[15] 本周重大事件宽窗口（--major-days）")
+# 用途：诺奖这类领域级事件常在窗口外一两天宣布（实测化学奖 10-07，
+# 而窗口是 10-08~10-10），按窗口纪律只能整条丢掉。
+# 设计要点：**只对重大源生效**，且进来的条目必须被显式打标。
+_m0, _m7 = TMP / "acc_mj0.json", TMP / "acc_mj7.json"
+_r0, _ = run("--domain", "science", "--class", "authority", "--days", "3",
+             "--max-per-source", "10", "--compact", "--out", str(_m0))
+_r7, _ = run("--domain", "science", "--class", "authority", "--days", "3",
+             "--major-days", "7", "--max-per-source", "10", "--compact", "--out", str(_m7))
+if _r0 == 0 and _r7 == 0 and _m0.exists() and _m7.exists():
+    _d0, _d7 = load(_m0), load(_m7)
+    check("关闭时 major_events_kept 为 0", _d0.get("stats", {}).get("major_events_kept"), 0)
+    _mj = [e for e in _d7["entries"] if e.get("major_window")]
+    check("开启后确有窗口外条目被纳入", len(_mj) > 0, True)
+    # ★ 反向断言：进来的必须如实标 in_window=False —— 它们**确实**不在基础窗口内。
+    #   粉饰这一点就等于静默放宽窗口，比漏报更糟。
+    check("宽窗口条目如实标 in_window=False",
+          all(e.get("in_window") is False for e in _mj), True)
+    check("宽窗口条目带 major_window_note（强制下游写明）",
+          all(e.get("major_window_note") for e in _mj), True)
+    check("stats 里报了纳入数（与 dropped 并列，不被漏读）",
+          _d7["stats"].get("major_events_kept"), len(_mj))
+    # ★ 反向断言：聚合器不得享受宽窗口。
+    #   实测「机构稿 09-28 → ScienceDaily 10-09 才转发」正是问题的来源；
+    #   让聚合器也拿宽窗口等于奖励慢转载。
+    check("聚合器不得进入宽窗口",
+          [e.get("source_key") for e in _mj
+           if e.get("source_key") in ("science-daily", "phys-org",
+                                      "hn-frontpage", "reddit-ml")], [])
+    # 关掉时必须与不加参数完全一致（默认关闭、无副作用）
+    _r_plain, _ = run("--domain", "science", "--class", "authority", "--days", "3",
+                      "--max-per-source", "10", "--compact",
+                      "--out", str(TMP / "acc_mj_plain.json"))
+    if _r_plain == 0:
+        _dp = load(TMP / "acc_mj_plain.json")
+        check("不传 --major-days 与传 0 结果一致（默认关闭、无副作用）",
+              (_dp["stats"]["kept"], _dp["stats"]["raw"],
+               _dp["stats"].get("major_events_kept")),
+              (_d0["stats"]["kept"], _d0["stats"]["raw"], 0))
+else:
+    check("宽窗口用例运行成功", False, True)
+
+# baidu-hot 已下架（4 镜像常态 3 个已死；当天 5 次失败只成功 2 次）
+check("baidu-hot 已从注册表移除", "baidu-hot" in ff.SOURCES, False)
+check("百度仍在 PLATFORM_WEIGHT 里（内容提到百度热榜时权重仍可解析）",
+      "baidu" in ff.PLATFORM_WEIGHT, True)
+check("_mirror_fetch 机制保留（通用能力，非死代码）",
+      callable(getattr(ff, "_mirror_fetch", None)), True)
+
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):
     p = subprocess.run([sys.executable, str(SKILL / "tests" / name)],
