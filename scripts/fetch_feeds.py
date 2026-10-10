@@ -1333,6 +1333,7 @@ def evidence_type_for(source_key: str, cls: str, entry: dict | None = None) -> s
                     au = entry.get("authors") or []
                     title = (entry.get("title") or "").strip()
                     no_abs = bool(entry.get("abstract_missing"))
+                    refs = entry.get("is_referenced_by_count")
                     reason = None
                     if "not available in your country" in title.lower():
                         reason = "标题为占位/栏目标题"
@@ -1340,6 +1341,22 @@ def evidence_type_for(source_key: str, cls: str, entry: dict | None = None) -> s
                         reason = "标题形态属栏目（随笔/影像/述评）"
                     elif no_abs and len(au) <= 1:
                         reason = f"无摘要且作者数≤1（{len(au)} 位）—— 评论/随笔形态"
+                    # ★ 试过再加一条「无摘要 + 作者数≤4 + 零被引 → 述评形态」，
+                    # **已删除：它误伤真研究论文。**
+                    # 实测：PNAS《GTP orchestrates CTP synthase via an allosteric
+                    # effector–cycle》（3 作者、Crossref 无摘要、被引数 0）被判成
+                    # journalism —— 而它是一篇真的研究论文。
+                    # 根因和 v1 一模一样：**新上线论文的被引数天然是 0**，
+                    # 「零被引」不能区分「评论」和「刚发表」。
+                    # 教训：这个位置任何基于「缺失信号」的规则都会误伤，
+                    # 因为 Crossref 的元数据覆盖率是不一致的。
+                    #
+                    # 因此本函数只保留【形态证据】：DOI 前缀 / 标题形态 / 作者数。
+                    # 已知漏判（保守代价，明说）：3 作者以上的述评/栏目仍会被标
+                    # peer-reviewed，例如 10.1038/s43588-026-01070-1。
+                    # 这类条目通常 body_missing → 真值封顶 0.50 → 落丢弃区，
+                    # 实际危害有限；而**误伤真论文会把 0.9 分的核心证据打掉**，
+                    # 代价大得多。两害相权，选漏判。
                     if reason:
                         entry["front_matter"] = True
                         entry["front_matter_reason"] = reason
@@ -2116,9 +2133,14 @@ def is_customer_story(entry: dict) -> bool:
     # 而 `how X is -ing` 两者都匹配。所以去掉它，宁可漏判。
     cust = re.search(
         r"(?i)\b(discover how|learn how|see how)\b"
-        # 第三方 + 动词 + 我们的产品名。动词表里刻意**不含 build/make/launch**——
-        # 那些是厂商自己的动作（"OpenAI launches…"），会误伤真公告。
-        r"|\b[a-z][\w.&'’-]{1,30}\s+(?:uses?|used|partnered|teams? up|"
+        # ★ 主体必须是**专有名词**（大写开头），不能是小写普通名词。
+        # 实测误标：`[a-z]` 起头时，arXiv 论文摘要里
+        # 「OpenAI agents exploited research infrastructure」也能匹配 ——
+        # 「agents」被当成客户主体 → 一篇 agent 安全预印本被判成厂商客户案例。
+        # 客户案例的主体永远是具名组织（Sophos / Asana / Oracle / Radiance…），
+        # 所以要求大写。这条同时把「OpenAI turns…」这类厂商自述挡在外面，
+        # 因为 OpenAI 自己不是自己的客户案例。
+        r"|\b[A-Z][\w.&'’-]{1,30}\s+(?:uses?|used|partnered|teams? up|"
         r"cut|cuts|turns?|brings?|advances?|advancing|scales?|scaling|"
         r"halves?|helps?|expands?)\s+"
         r"(?:openai|chatgpt|codex|gpt|its|their|days|creative|hotel|quant|enterprise)"

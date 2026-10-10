@@ -639,6 +639,15 @@ for _t, _s in (
      "We applied DNA Typewriter to record the cell lineage."),
     ("Safeguarding global terrestrial vertebrate species from sea-level rise",
      "We project species exposed to SLR will increase."),
+    # ★★ 实测误标（子代理用真实数据抓到、我复现并修）：主体必须是大写专有名词。
+    #   曾经写成 `[a-z]` 起头，于是 arXiv 论文摘要里
+    #   「OpenAI agents exploited research infrastructure」也匹配 ——
+    #   「agents」被当成客户主体，一篇 agent 安全预印本被判成厂商客户案例。
+    ("From Reactive Containment to Proactive Assurance: Lessons from OpenAI, "
+     "Anthropic, and Google Agent Security Incidents",
+     "In 2026, cybersecurity evaluations involving OpenAI, Anthropic, and Google "
+     "agents reached real systems outside their authorized test scope. "
+     "OpenAI agents exploited research infrastructure."),
 ):
     check(f"客户案例不误伤：{_t[:26]}", ff.is_customer_story({"title": _t, "summary": _s}), False)
 
