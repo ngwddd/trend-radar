@@ -410,9 +410,11 @@ check("研究论文仍高于预印本",
       ff.truth_weight("crossref-nature", "authority",
                       entry={"doi": "10.1038/s41586-026-x"})
       > ff.truth_weight("biorxiv", "authority", entry={"doi": "10.1101/x"}), True)
-check("journalism 只认 d41586- 前缀（兜底规则已删）",
+check("栏目判定不再靠「引用数 0」兜底（v1 的误伤来源）",
       ff.evidence_type_for("crossref-natcomp", "authority",
                            {"doi": "10.1038/s43588-026-01070-1",
+                            "title": "Epidemiological modeling in the age of AI",
+                            "authors": ["A B", "C D"],
                             "abstract_missing": True,
                             "is_referenced_by_count": 0}), "peer-reviewed")
 
@@ -551,6 +553,110 @@ if rc == 0 and _edge_out.exists():
           de["stats"].get("external_dropped_out_of_window"), 2)
 else:
     check("窗口粒度用例运行成功", False, True)
+
+print("\n[12] 期刊栏目判定 / 0 条源漏斗 / 信号词 / 客户案例 / --list 口径")
+# ── 这一节全部来自真实运行的漏判，每一条都对应一次实际错误 ──────────────
+# 判据：**只测「应判对」不够，每个都要测反方向**（子代理第一轮抓到的教训：
+# 只测「应合并」的断言，让一个方向相反的过归一 bug 完整活了下来）。
+
+# ① 期刊「评论栏目」曾被标成 peer-reviewed。
+#    实测 crossref-nature 15 条全是 d41586- 前缀（这条本来就对），
+#    但 crossref-nejm 6 条全是 Perspective/病例影像（DOI 不是 d41586-）→ 全漏判。
+check("栏目判定：NEJM Perspective → journalism",
+      ff.evidence_type_for("crossref-nejm", "authority",
+                           {"doi": "10.1056/NEJMp2601234",
+                            "title": "Who Counts as Infertile? A Missed Opportunity",
+                            "authors": ["A B"], "abstract_missing": True}),
+      "journalism")
+check("栏目判定：病例影像 → journalism",
+      ff.evidence_type_for("crossref-nejm", "authority",
+                           {"doi": "10.1056/NEJMicm2601234",
+                            "title": "Flushing in Carcinoid Syndrome",
+                            "authors": ["A B"], "abstract_missing": True}),
+      "journalism")
+check("栏目判定：无作者 → journalism",
+      ff.evidence_type_for("crossref-natcomp", "authority",
+                           {"doi": "10.1038/s43588-026-01071-0",
+                            "title": "Photonic circuits become trainable AI hardware",
+                            "authors": [], "abstract_missing": True}),
+      "journalism")
+check("栏目判定：d41586- 前缀仍判 journalism",
+      ff.evidence_type_for("crossref-nature", "authority",
+                           {"doi": "10.1038/d41586-026-03217-6",
+                            "title": "Books in brief", "authors": [], "abstract_missing": True}),
+      "journalism")
+# ★ 反方向：真研究论文**不能**被误判成栏目。
+#   这条是上一版（v1 兜底规则）翻车的地方，必须守住。
+check("栏目判定不误伤：有摘要的多作者研究论文 → peer-reviewed",
+      ff.evidence_type_for("crossref-nature", "authority",
+                           {"doi": "10.1038/s41586-026-10910-z",
+                            "title": "Psychedelics align brain activity with context",
+                            "authors": ["A B", "C D", "E F"], "abstract_missing": False}),
+      "peer-reviewed")
+check("栏目判定不误伤：无摘要但多作者的研究论文 → peer-reviewed",
+      ff.evidence_type_for("crossref-pnas", "authority",
+                           {"doi": "10.1073/pnas.2619925123",
+                            "title": "GTP orchestrates CTP synthase",
+                            "authors": ["A B", "C D", "E F"], "abstract_missing": True}),
+      "peer-reviewed")
+
+# ② 信号词只从【正文】抽。标题里的孤立形容词是假阳性来源。
+check("信号词：无正文不抽（标题人名里有 huge）",
+      ff.signal_words({"title": "drea de matteo", "summary": ""}), [])
+check("信号词：无正文不抽（技术词 Alarming）",
+      ff.signal_words({"title": "I built ALHR: Alarming latency", "summary": ""}), [])
+check("信号词：有正文才抽",
+      ff.signal_words({"title": "x", "summary": "The decline was unprecedented and dramatic."}),
+      ["unprecedented", "dramatic"])
+check("信号词：中文程度词",
+      ff.signal_words({"title": "x", "summary": "有关部门高度重视，彻底排查隐患。"}),
+      ["彻底"])
+
+# ③ 客户案例：营销内容但**不是广告形式**，`is_promotional` 抓不到，要单独判。
+#    实测 openai-news 落地 9 条里 5 条是这类，全部 truth=0.816 与真公告同分。
+for _t, _s in (
+    ("Sophos cuts threat investigation time by 96% with OpenAI Daybreak",
+     "Discover how Sophos uses OpenAI's Daybreak to cut investigation time by 96%."),
+    ("Asana cuts model costs 76x in browser tests with GPT-6.1 Sol",
+     "Using GPT-6 Astra in Codex, Asana made its browser agent 76x cheaper."),
+    ("How Oracle turns days of work into minutes with ChatGPT and Codex",
+     "Oracle turns specialist knowledge into workflows with ChatGPT Work."),
+    ("Radisson Hotel Group brings hotel discovery into ChatGPT",
+     "Radisson partnered with Accenture to build a ChatGPT plugin."),
+    ("How Jump Trading is scaling quant research with ChatGPT",
+     "Jump Trading uses OpenAI to expand quantitative research."),
+):
+    check(f"客户案例识别：{_t[:26]}", ff.is_customer_story({"title": _t, "summary": _s}), True)
+# ★ 反方向：真公告与研究论文**不能**被误判（这是收紧判据的原因 ——
+#   `how X is -ing` 会连 OpenAI 自己的公告一起抓）。
+for _t, _s in (
+    ("GPT-6 and Intelligent UI for everyone", "GPT-6 is rolling out globally in ChatGPT."),
+    ("Disrupting AI-enabled false front operations",
+     "OpenAI disrupted two influence operations."),
+    ("Our approach to EU text provenance rules",
+     "How OpenAI is approaching text watermarking under EU rules."),
+    ("A DNA Typewriter records the cell lineage history of a mouse",
+     "We applied DNA Typewriter to record the cell lineage."),
+    ("Safeguarding global terrestrial vertebrate species from sea-level rise",
+     "We project species exposed to SLR will increase."),
+):
+    check(f"客户案例不误伤：{_t[:26]}", ff.is_customer_story({"title": _t, "summary": _s}), False)
+
+# ④ 0 条源必须有 funnel 键（否则「0 条」在结构上双重不可见：
+#    进不了 stale-feed，也进不了漏斗表）。
+_z = TMP / "acc_zero.json"
+_rc, _ = run("--domain", "science", "--class", "authority", "--days", "3",
+             "--max-per-source", "5", "--compact", "--out", str(_z))
+if _rc == 0 and _z.exists():
+    _dz = load(_z)
+    _fn = _dz.get("source_funnel") or {}
+    _req = set((_dz.get("requested") or {}).get("resolved_sources") or [])
+    check("每个被请求的源都有 funnel 键（含返回 0 条的）",
+          sorted(_req - set(_fn)), [])
+    _zero = [k for k, v in _fn.items() if v.get("fetched") == 0 and v.get("emitted") == 0]
+    check("0 条源被标 empty_feed", all(_fn[k].get("empty_feed") for k in _zero), True)
+else:
+    check("0 条源漏斗用例运行成功", False, True)
 
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):

@@ -1280,6 +1280,16 @@ def normalize_identity(text: str) -> str:
 # while being books-in-brief columns, photo essays and briefing chats.
 RE_NEWS_DOI = re.compile(r"^10\.\d{4,}/d41586-", re.I)
 
+# 期刊栏目标题的形态。实测漏判来源：crossref-nejm 本期 6 条**全部**是
+# Perspective / 病例影像 / 随笔，DOI 不是 d41586-，所以只靠 DOI 前缀抓不到。
+# 这些形态词在**栏目标题**里高频、在**研究论文标题**里几乎不出现。
+RE_FRONT_TITLE = re.compile(
+    r"(?i)\b(perspective|editorial|commentary|correspondence|viewpoint|"
+    r"images? in clinical medicine|clinical implications|letters? to the editor|"
+    r"case report|in focus|book review|obituary|in memoriam|"
+    r"a missed opportunity|"
+    r"flushing in|not available in your country)\b")
+
 
 def evidence_type_for(source_key: str, cls: str, entry: dict | None = None) -> str:
     """Infer the evidence tier from the source itself (no guessing by the model).
@@ -1296,13 +1306,44 @@ def evidence_type_for(source_key: str, cls: str, entry: dict | None = None) -> s
                     entry["front_matter"] = True
                     entry["front_matter_reason"] = "DOI 前缀 d41586-（Nature 新闻/书评栏目）"
                     return "journalism"
-                # 曾经的兜底规则（无摘要 + 引用数 0 → journalism）已【删除】。
-                # 实测它误伤真研究论文：Nature Computational Science 的
-                # 10.1038/s43588-026-01070-1 / -01071-0 / -01064-z 三条被判
-                # journalism 0.674，而同刊同日带摘要的 -01063-0 拿 peer-reviewed
-                # 0.896 —— 同栏目差 0.222。Crossref 的摘要覆盖率是不一致的，
-                # 拿"没有摘要"当"不是论文"的证据不成立。
-                # DOI 前缀是可靠判据，兜底规则带来的是误伤，不是覆盖。
+                # ★ 栏目判定必须看【内容形态】，不能看"有没有摘要"。
+                #
+                # 这段历史值得留着，因为两版都在同一处翻过车：
+                #
+                #   v1（错）：`无摘要 AND 引用数==0 → journalism`。
+                #     误伤真研究论文 —— Nature Comput Sci 的 -01070-1/-01071-0/-01064-z
+                #     被判 journalism 0.674，而同刊同日带摘要的 -01063-0 拿 0.896。
+                #     根因：**Crossref 的摘要覆盖率是不一致的**，"没有摘要"不等于
+                #     "不是论文"。整条规则已删除。
+                #
+                #   v2（本版）：只看 d41586- 前缀。结果反向漏判 ——
+                #     实测 `crossref-nature` 本期 15 条**全部**是新闻/书评/图片栏目
+                #     （DOI 确实是 d41586-，这条抓到了），但
+                #     `crossref-nejm` 6 条**全部**是 Perspective / 病例影像 / 随笔
+                #     （DOI 不是 d41586-，**全部漏判成 peer-reviewed**），
+                #     `crossref-natcomp` 4 条里 3 条是评论/Highlight，同样漏判。
+                #
+                # 本版的判据只用**栏目形态**，不用"引用数"：
+                #   ① d41586- 前缀（Nature 前栏目，可靠）
+                #   ② 标题形态：无作者、单作者、或标题本身是栏目标题
+                #   ③ 无摘要 **且** 作者数 ≤1（单作者 + 无摘要 = 评论/随笔的典型形态；
+                #      真研究论文极少单作者且无摘要）
+                # 三条都是"形态"证据，与摘要覆盖率无关，所以不会重演 v1 的误伤。
+                if entry:
+                    au = entry.get("authors") or []
+                    title = (entry.get("title") or "").strip()
+                    no_abs = bool(entry.get("abstract_missing"))
+                    reason = None
+                    if "not available in your country" in title.lower():
+                        reason = "标题为占位/栏目标题"
+                    elif RE_FRONT_TITLE.search(title):
+                        reason = "标题形态属栏目（随笔/影像/述评）"
+                    elif no_abs and len(au) <= 1:
+                        reason = f"无摘要且作者数≤1（{len(au)} 位）—— 评论/随笔形态"
+                    if reason:
+                        entry["front_matter"] = True
+                        entry["front_matter_reason"] = reason
+                        return "journalism"
             return "peer-reviewed"
         if source_key == "openai-news":
             return "official"
@@ -1614,8 +1655,16 @@ def signal_words(entry: dict, limit: int = 8) -> list[str]:
 
     返回原文片段（不改写），去重、按出现顺序，最多 `limit` 个。
     **不进 claim** —— 调用方负责把它们放在 claim 之外。
+
+    ★ 必须**只从正文抽**，标题不算。实测两个假阳性都出在标题上：
+      `drea de matteo` → `['huge']`（人名里的词）
+      `I built ALHR: ... Alarming` → `['Alarming']`（技术词被当评价）
+    标题天然短、缺上下文，一个孤立的形容词几乎不可能是"报道者的判断痕迹"。
+    摘要有句子语境，抽出才可信。
     """
-    blob = " ".join([entry.get("title") or "", entry.get("summary") or ""])
+    blob = (entry.get("summary") or "")
+    if not blob:
+        return []                    # 没有正文就没什么可抽的
     seen, out = set(), []
     for rx in (RE_SIGNAL_ZH, RE_SIGNAL_EN):
         for m in rx.finditer(blob):
@@ -2032,6 +2081,56 @@ PROMO_BODY_MARKERS = (
 )
 
 
+def is_customer_story(entry: dict) -> bool:
+    """厂商官网上「X 公司用我们的产品做到了 Y」这类客户案例／成果叙事。
+
+    与 `is_promotional` 分开，因为**判据不同**：
+      `is_promotional` 抓的是**广告形式**（白皮书/导购/赞助稿/价格）
+      `is_customer_story` 抓的是**营销内容但非广告形式** —— 实测
+      `openai-news` 落地 9 条里 5 条是这类，全部 truth=0.816，
+      与真公告（GPT-6 发布、影响行动取缔通报）**同分同区，无法区分**。
+      判据用标题的广告词完全抓不到它们（标题是「Sophos cuts … by 96%」）。
+
+    实测样本（都是真阳性）：
+      Sophos cuts threat investigation time by 96% with OpenAI Daybreak
+      Asana cuts model costs 76x in browser tests with GPT-6.1 Sol
+      How Oracle turns days of work into minutes with ChatGPT and Codex
+      Pollo AI turns creative ideas into campaigns with OpenAI
+      LegalOn halves Codex costs while maintaining development speed
+      Radisson Hotel Group brings hotel discovery into ChatGPT
+
+    形态：**一个具名第三方公司 + 一个数量化的收益 + 我们的产品**。
+    """
+    t = (entry.get("title") or "").lower()
+    s = (entry.get("summary") or "").lower()
+    blob = f"{t} {s}"
+    if any(k in blob for k in ("customer story", "case study", "客户案例", "客户故事")):
+        return True
+
+    # 形态：一个具名第三方 + 一个「拿去做成了什么」的动作。
+    #
+    # ⚠️ 只保留**明确的客户叙事引子**和**第三方动作**。曾经加过
+    # `how [a-z]+ is|are` 想覆盖「How Jump Trading is scaling…」，
+    # 结果把 OpenAI 自己的公告也抓了（「How OpenAI is approaching text watermarking」
+    # 「How to…」）—— 判据必须能区分「我们说我们怎么做」和「客户说他们怎么做」，
+    # 而 `how X is -ing` 两者都匹配。所以去掉它，宁可漏判。
+    cust = re.search(
+        r"(?i)\b(discover how|learn how|see how)\b"
+        # 第三方 + 动词 + 我们的产品名。动词表里刻意**不含 build/make/launch**——
+        # 那些是厂商自己的动作（"OpenAI launches…"），会误伤真公告。
+        r"|\b[a-z][\w.&'’-]{1,30}\s+(?:uses?|used|partnered|teams? up|"
+        r"cut|cuts|turns?|brings?|advances?|advancing|scales?|scaling|"
+        r"halves?|helps?|expands?)\s+"
+        r"(?:openai|chatgpt|codex|gpt|its|their|days|creative|hotel|quant|enterprise)"
+        r"|\bexpand(?:s|ed|ing)? (?:its |their |the )?partnership\b",
+        blob)
+    # 「第三方公司 + 量化收益」同现在标题里，也算。
+    quant_t = re.search(r"(?i)\b\d+(?:\.\d+)?\s*(?:x|×|%|percent|times|fold)\b", t)
+    gain_t = re.search(r"(?i)\b(cuts?|cutting|halves?|halving|turns?|boosts?|speeds? up|"
+                       r"saves?|reduces?|doubles?|triples?|slashes?|expands?)\b", t)
+    return bool(cust or (quant_t and gain_t))
+
+
 def promo_position(entry: dict) -> str | None:
     """Return 'title' | 'body' | None -- where the promotional signal sits."""
     title = (entry.get("title") or "").lower()
@@ -2197,6 +2296,7 @@ def compact_view(result: dict, summary_chars: int = 600) -> dict:
             "passes_truth", "passes_comm", "passes_gate",
             "also_seen_in", "corroborated_by",
             "promotional_signal", "promo_body_hit", "promo_note",
+            "customer_story", "customer_story_note",
             "trend_capped", "trend_rank", "trend_heat", "body_missing", "body_note",
             "record_alert", "front_matter", "front_matter_reason",
             "abstract_missing", "update_notices", "related_news",
@@ -2379,12 +2479,20 @@ def main() -> int:
 
     if args.list:
         print("DOMAINS (三大类，从用户需求判断属于哪一类)")
-        print("  注：下面的源数按 `domains` 字段统计（一个源可属多类）。")
-        print("      下面 REGISTRY 段的源数按 `class` 字段统计 —— 两个口径不同，不是笔误。")
+        print("  注：`domains` 字段是【粗粒度归属】，`class` 才是【实际路由】。")
+        print("      一个源可以被标进某域、但它的 class 让它在 --domain X 时被排除。")
+        print("      所以下面同时给【域内源数】和【--domain X 实际能取到的源数】——")
+        print("      实测这两者曾经差一倍（social 域标 7 源，实际只取到 3 源），")
+        print("      只看域内源数会高估覆盖。")
         for dom, desc in DOMAINS.items():
             members = sorted(k for k, v in SOURCES.items() if dom in v.get("domains", []))
             print(f"  {dom:8} {desc}")
-            print(f"           {len(members)} 源: {', '.join(members)}")
+            print(f"           domains 标了 {len(members)} 源: {', '.join(members)}")
+            for kl in ("authority", "social", "trend"):
+                hit = sorted(k for k in members if SOURCES[k].get("class") == kl)
+                if hit:
+                    print(f"           --domain {dom} --class {kl:9} → {len(hit)} 源"
+                          + ("  ← ⚠ 交集很小" if len(hit) <= 3 else ""))
         print("\nREGISTRY  (class 决定喂给哪一路)")
         for klass in ("authority", "social", "trend"):
             n = len([k for k, v in SOURCES.items() if v.get("class") == klass])
@@ -2870,6 +2978,16 @@ def main() -> int:
             if sw:
                 entry["signal_words"] = sw
 
+        # 客户案例／成果叙事：营销内容但**不是广告形式**，所以 is_promotional
+        # 抓不到。单独标记，让下游能把它与真公告区分开。
+        # 不是删除，是标注 —— 厂商自述仍有信息价值，只是不能当独立验证。
+        cs = is_customer_story(entry)
+        entry["customer_story"] = cs
+        if cs:
+            entry["customer_story_note"] = (
+                "厂商官网的客户案例/成果叙事：量化收益由厂商与客户共同提供，"
+                "**不是独立验证**。已单独标记，不要与真公告同权重看待。")
+
         entry["pickups"] = pickups
         entry["trend_boards"] = trend_saturation(entry)
         entry["corroborated_by"] = sorted(others)
@@ -3086,6 +3204,17 @@ def main() -> int:
             {"fetched": 0, "dropped_window": 0, "merged_into_other": 0,
              "capped_out": 0, "emitted": 0})
 
+    # ★ 为【每一个被请求的源】预建漏斗键，即使它返回 0 条。
+    # 实测 bug：漏斗只在有条目时才建键，于是返回 0 条的源在 `source_funnel` 里
+    # **连键都没有** —— 本次实测 crossref-cell / lancet / natbiotech / sciadv 四个源
+    # 全部如此。后果是「0 条」这个事实在结构上【双重不可见】：
+    #   ① 进不了 stale-feed（判据要求 dated 非空）
+    #   ② 也进不了漏斗表（没有键）
+    # 于是权威面 13 个源里 4 个空转，而任何一张表都看不出来。
+    # 预建键之后，"这个源被请求了、返回 0 条"本身就是一个可读的事实。
+    for _k in keys:
+        _f(_k)
+
     for e in entries:
         rec = _f(e.get("source_key") or e.get("source_label"))
         rec["fetched"] += 1
@@ -3102,6 +3231,22 @@ def main() -> int:
         rec["unaccounted"] = max(
             rec["fetched"] - rec["emitted"] - rec["merged_into_other"]
             - rec["capped_out"] - rec["dropped_window"], 0)
+        # 0 条要能被读出来，且带上耗时 —— 0 条 + 极短耗时是"空 feed"的典型形态，
+    # 与"抓到了但全被过滤"是两回事。
+    for r in report:
+        rec = funnel.get(r["source"])
+        if rec is None:
+            continue
+        sec = r.get("seconds")
+        if sec is not None:
+            rec["seconds"] = sec
+        if r.get("status") == "ok" and not (r.get("count") or 0):
+            rec["empty_feed"] = True
+            # 实测对比：arxiv-rss-ai 0 条时耗时 0.03s（空 feed 立即返回），
+            # 而 arxiv-ai 正常抓取 11.66s。0 条 + <1s 基本可以断定 feed 是空的，
+            # 不是"窗口内没有新条目"。但这只是可疑标记，不是判决。
+            if sec is not None and sec < 1.0:
+                rec["empty_feed_suspect"] = True
 
     # ---- 异常降级：某一路全挂必须显式标记，不能让报告看起来像完整覆盖 ----
     # 实测：某一路全部源失败时，输出里只是少了那一份数据，没有任何字段说明，
