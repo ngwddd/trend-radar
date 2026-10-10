@@ -231,16 +231,20 @@ if rc == 0 and out_path.exists():
 else:
     check("注入用例运行成功", False, True)
 
-print("\n[7] 统计自洽 · kept == entries == 四桶之和")
+print("\n[7] 统计自洽 · kept == entries == 各桶之和")
 out_path = TMP / "acc_consistency.json"
 rc, out = run("--domain", "ai", "--class", "authority", "--days", "3",
               "--max-per-source", "12", "--out", str(out_path))
 if rc == 0 and out_path.exists():
     d = load(out_path)
     s = d["stats"]
-    buckets = s["passed_both"] + s["truth_only"] + s["comm_only"] + s["failed_gate"]
+    # 五个桶：真·双项达标 / 单源硬证据通道 / 真值only / 传播only / 双项未达标。
+    # 「单源硬证据」2026-10-10 从 passed_both 里拆出来独立计数
+    # （共用计数器会让「双项达标」虚报印证程度）。
+    buckets = (s["passed_both"] + s.get("passed_single_source", 0)
+               + s["truth_only"] + s["comm_only"] + s["failed_gate"])
     check("kept == entries length", s["kept"], len(d["entries"]))
-    check("kept == 四桶之和", s["kept"], buckets)
+    check("kept == 各桶之和", s["kept"], buckets)
 else:
     check("自洽用例运行成功", False, True)
 
@@ -692,11 +696,12 @@ if _rc == 0 and _gt.exists():
               if e.get("single_source_hard_evidence")), True)
     check("official 类型不得走单源通道进核心区",
           [e.get("title") for e in _core if e.get("evidence_type") == "official"], [])
-    # 自洽性：kept 必须等于四桶之和（实测曾出现 kept=32 而四桶和=507）
+    # 自洽性：kept 必须等于各桶之和（实测曾出现 kept=32 而桶和=507）
     _s = _dg["stats"]
-    check("闸门自洽：kept == len(entries) == 四桶之和",
+    check("闸门自洽：kept == len(entries) == 各桶之和",
           (_s["kept"], len(_dg["entries"]),
-           _s["passed_both"] + _s["truth_only"] + _s["comm_only"] + _s["failed_gate"]),
+           _s["passed_both"] + _s.get("passed_single_source", 0)
+           + _s["truth_only"] + _s["comm_only"] + _s["failed_gate"]),
           (_s["kept"], _s["kept"], _s["kept"]))
 else:
     check("单源通道用例运行成功", False, True)
@@ -752,6 +757,18 @@ if _r0 == 0 and _r7 == 0 and _m0.exists() and _m7.exists():
           all(e.get("major_window_note") for e in _mj), True)
     check("stats 里报了纳入数（与 dropped 并列，不被漏读）",
           _d7["stats"].get("major_events_kept"), len(_mj))
+    # ★ 「双项达标」与「单源硬证据」必须分开计数。
+    # 实测问题（子代理用真实数据抓到）：两者曾共用 `passed_both`，于是 stdout
+    # 打出「双项达标 25」而逐条是 passes_comm=0 —— 那 25 条**没有一条经过
+    # 独立印证**。这个数字唯一该回答的问题是「多少条真的被多家印证过」。
+    _s7 = _d7["stats"]
+    check("单源硬证据与双项达标分开计数（不得共用计数器）",
+          "passed_single_source" in _s7 and _s7["passed_single_source"] > 0, True)
+    check("科学权威面：真·双项达标应为 0（comm 全 0.3，无独立印证）",
+          _s7["passed_both"], 0)
+    check("分开计数后总量仍守恒",
+          _s7["passed_both"] + _s7["passed_single_source"] + _s7["truth_only"]
+          + _s7["comm_only"] + _s7["failed_gate"], _s7["kept"])
     # ★ 反向断言：聚合器不得享受宽窗口。
     #   实测「机构稿 09-28 → ScienceDaily 10-09 才转发」正是问题的来源；
     #   让聚合器也拿宽窗口等于奖励慢转载。
@@ -778,6 +795,33 @@ check("百度仍在 PLATFORM_WEIGHT 里（内容提到百度热榜时权重仍�
       "baidu" in ff.PLATFORM_WEIGHT, True)
 check("_mirror_fetch 机制保留（通用能力，非死代码）",
       callable(getattr(ff, "_mirror_fetch", None)), True)
+
+# ── 多版面源的 cap 不得按"哪个 feed 先返回"挑选版面 ──────────────────
+# 实测 bug（子代理用真实数据抓到，我复现）：`fetch_rss_multi` 用
+# `as_completed` 按**完成顺序**合并，先回来的版面独占 `--max-per-source` 名额。
+# chinanews 4 个版面窗内共 120 条，实际只送出 15 条且**全部来自财经版面**，
+# 社会/国内/滚动一条都没送出来。
+# 后果不只是数量：**看到的世界被"哪个 feed 先返回"决定了**，
+# 且随每次网络抖动变化、无法复现。
+import re as _re
+import collections as _collections
+_cn_j = TMP / "acc_cn.json"
+_rcn, _ = run("--source", "chinanews", "--days", "3", "--max-per-source", "15",
+              "--compact", "--out", str(_cn_j))
+if _rcn == 0 and _cn_j.exists():
+    _dcn = load(_cn_j)
+    _cn_e = [e for e in _dcn["entries"] if e.get("source_key") == "chinanews"]
+    _sections = _collections.Counter(
+        (_re.search(r"chinanews\.com\.cn/(\w+)/", e.get("url") or "") or [None, "?"])[1]
+        if _re.search(r"chinanews\.com\.cn/(\w+)/", e.get("url") or "") else "?"
+        for e in _cn_e)
+    check("多版面源不只吐出一个版面（cap 不得按完成顺序挑版面）",
+          len(_sections) >= 3, True)
+    _dates = [str(e.get("published") or "") for e in _cn_e]
+    check("多版面源结果按时间降序（cap 取的是全版面最新一批）",
+          _dates == sorted(_dates, reverse=True), True)
+else:
+    check("多版面源用例运行成功", False, True)
 
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):

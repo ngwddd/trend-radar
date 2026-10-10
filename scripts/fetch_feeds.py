@@ -924,6 +924,19 @@ def fetch_rss_multi(urls: list[str], label: str, ua: str | None = None,
             continue
         seen.add(k)
         uniq.append(e)
+    # ★ 必须按时间【降序】排序后再交给下游的单源限流。
+    #
+    # 实测 bug（子代理用真实数据抓到）：`as_completed` 按**完成顺序**合并结果，
+    # 于是先回来的那个版面独占 `--max-per-source` 的名额。
+    # `chinanews` 4 个版面窗内共 **120 条**，实际只送出 **15 条，且全部来自
+    # 财经版面 `/cj/`** —— 社会 `/sh/`、国内 `/gn/`、滚动版面**一条都没被送出来**。
+    # 这不只是数量问题：**agent 看到的世界被"哪个 feed 先返回"决定了**，
+    # 而它对每次网络抖动的结果都不一样、无法复现。
+    #
+    # 限流本身是对的（成本控制），错的是**限流的对象**：应该限"给多少条"，
+    # 不该限"给哪个版面"。按时间降序之后，cap 拿到的是全版面里最新的一批。
+    # 与 `ARCHIVE_SOURCES` 的增量截断用的是同一个办法。
+    uniq.sort(key=lambda e: e.get("published") or "", reverse=True)
     return uniq, failed
 
 
@@ -3209,7 +3222,14 @@ def main() -> int:
         capped.append(entry)
 
     # ---- gate accounting: on `capped`, i.e. exactly what gets emitted ----
-    passed_truth = passed_comm = passed_both = failed = 0
+    # ★ `passed_both` 与 `passed_single` 必须【分开计数】。
+    # 实测问题（子代理用真实数据抓到）：两者曾共用 `passed_both`，
+    # 于是 stdout 打出「双项达标 25」，而逐条字段是
+    # `passes_truth=25 / passes_comm=0`（comm 全 0.3）—— 那 25 条**全是**
+    # 单源硬证据通道，没有一条经过独立印证。
+    # 后果比少报更糟：**引用「双项达标 25」会严重高估印证程度**，
+    # 而"有多少条真的被多家印证过"正是这个数字唯一该回答的问题。
+    passed_truth = passed_comm = passed_both = passed_single = failed = 0
     for entry in capped:
         sev = notice_severity(entry.get("update_notices") or [])
         if sev:
@@ -3273,7 +3293,7 @@ def main() -> int:
                 "★ 单源硬证据通道：真值达标 + 证据类型为 "
                 f"{entry.get('evidence_type')}，但【未经独立印证】"
                 f"（comm={entry['comm_score']}）。可引用，必须标注单源。")
-            passed_both += 1
+            passed_single += 1
         elif entry["passes_gate"]:
             entry["section"] = "核心区"
             entry["gate_note"] = "双项达标 → 核心区"
@@ -3317,7 +3337,7 @@ def main() -> int:
 
     # Surface a structural warning: if nothing at all passed truth, the domain is
     # probably served only by preprints (which top out at 0.578 < 0.6).
-    truth_passers = passed_both + passed_truth
+    truth_passers = passed_both + passed_single + passed_truth
     if capped and truth_passers == 0:
         # Only meaningful when an AUTHORITY stream was actually selected. Measured
         # bug: a pure `--class trend` run printed the "本域权威面只有预印本" warning
@@ -3584,6 +3604,7 @@ def main() -> int:
             "errata_dropped": errata_dropped,
             "gate_threshold": CREDIBILITY_THRESHOLD,
             "passed_both": passed_both,
+            "passed_single_source": passed_single,
             "truth_only": passed_truth,
             "comm_only": passed_comm,
             "failed_gate": failed,
@@ -3669,8 +3690,14 @@ def main() -> int:
               f"{errata_dropped} errata dropped, "
               f"{overflow} over per-source cap)")
         s = result["stats"]
+        # ★ 「双项达标」必须与「单源硬证据通道」分开报。
+        # 实测：两者曾共用一个计数器，于是打出「双项达标 25」而 passes_comm=0 ——
+        # 那 25 条**没有一条经过独立印证**。这个数字唯一该回答的问题是
+        # 「多少条真的被多家印证过」，混在一起就等于虚报。
         print(f"  权重闸门     : 阈值 {CREDIBILITY_THRESHOLD} | "
-              f"双项达标 {s['passed_both']} | 真实达标/传播未达标 {s['truth_only']} | "
+              f"双项达标（已独立印证）{s['passed_both']} | "
+              f"单源硬证据（未印证）{s.get('passed_single_source', 0)} | "
+              f"真实达标/传播未达标 {s['truth_only']} | "
               f"传播达标/真实未达标 {s['comm_only']} | 双项未达标 {s['failed_gate']}")
         # Read relevance keys defensively. Measured crash: the classifier branch
         # nests keywords under `keyword_advisory` instead of at the top level, so

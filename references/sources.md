@@ -46,6 +46,24 @@ p.write_bytes(new.encode("utf-8"))
 并记进 `sub_feed_failures` → 控制台打 `★ 版面降级`。
 **没有这个的话，「4 个版面只成功 1 个」会看起来像「这家今天内容少」** —— 同一类静默陷阱。
 
+### ⚠️ 多版面源必须先按时间排序，再交给单源限流
+
+实测 bug（子代理用真实数据抓到，我复现）：`fetch_rss_multi` 用 `as_completed`
+按**完成顺序**合并，于是**先返回的那个版面独占 `--max-per-source` 名额**。
+
+```
+chinanews 4 个版面窗内共 120 条
+  → 实际只送出 15 条，且【全部来自财经版面 /cj/】
+  → 社会 /sh/、国内 /gn/、滚动版面 一条都没被送出来
+```
+
+**这不只是数量问题**：agent 看到的世界被「哪个 feed 先返回」决定了，
+而它对每次网络抖动给出不同结果、**无法复现**。
+
+修法：`uniq.sort(key=published, reverse=True)` 之后再交给下游 cap ——
+**cap 该限「给多少条」，不该限「给哪个版面」**。
+与 `ARCHIVE_SOURCES` 的增量截断用的是同一个办法。
+
 ## 新增源必须显式登记权重
 
 `SOURCE_WEIGHT.get(source_key, 0.50)` 有个兜底默认值。实测新加的 `chinanews`
