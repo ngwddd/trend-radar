@@ -44,6 +44,10 @@ def _find_skill_root() -> pathlib.Path:
 SKILL = _find_skill_root()
 FETCH = SKILL / "scripts" / "fetch_feeds.py"
 WORK = pathlib.Path(tempfile.gettempdir()) / "radartest"
+# 必须显式创建。实测 bug：这里只声明不创建，而下面会往 WORK 里写文件 ——
+# 干净机器 / CI 上 `%TEMP%\radartest` 不存在 → FileNotFoundError。
+# 子代理用隔离 TEMP 目录跑时踩到过，说明它依赖的是"这台机器上恰好有那个目录"。
+WORK.mkdir(parents=True, exist_ok=True)
 
 # Each entry mirrors a source that ACTUALLY carried the claim, using the real
 # registry key so the weight table applies exactly as it would in production.

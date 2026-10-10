@@ -20,6 +20,8 @@ import hashlib
 import json
 import pathlib
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import ssl
 import sys
 import time
@@ -62,7 +64,12 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 SSL_CONTEXT = _ssl_context()
-_HTTP_CACHE: dict[tuple[str, str], bytes] = {}
+# 键是 (url, ua, timeout)。`_mirror_fetch` 现在用线程池并发竞速镜像，
+# 所以这个 dict 会被多线程读写 —— 加锁。竞争窗口极小（只是 dict 存取），
+# 但并发写 dict 在 CPython 之外不保证安全，而且"偶发损坏的缓存"
+# 是最难查的一类 bug。
+_HTTP_CACHE: dict[tuple[str, str, int], bytes] = {}
+_CACHE_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Three main domains. The pipeline picks ONE of these from the user's request,
@@ -552,7 +559,13 @@ SOURCES: dict[str, dict] = {
         ],
         "label": "百度热搜 (via RSSHub mirror)",
         "status": "OK",
-        "note": "按热度排序；公众面最广的中文热度榜。镜像站逐个试，全挂则此源不可用",
+        # 并发竞速 + 每镜像 10s 上限。实测：串行时最坏 4×(3×25+2+4)=324s，
+        # 而且确实出现过一次 94s 全挂；并行后实测 0.6s（拿到 51 条）。
+        # 热度榜是「有就有、没有就算了」的校准信号，不值得为它等 25 秒。
+        "mirror_timeout": 10,
+        "note": ("按热度排序；公众面最广的中文热度榜。4 个镜像【并发竞速】，"
+                 "每个 10s 上限，先拿到非空结果的胜出。实测 4 个里常态化 3 个已死"
+                 "（1 个 403、2 个 DNS 失败），所以并发是必需的，不是优化"),
     },
     "toutiao-hot": {
         "kind": "toutiao_hot",
@@ -667,8 +680,9 @@ def _get(url: str, *, retries: int = 0, ua: str | None = None,
     """
     t = timeout or TIMEOUT
     cache_key = (url, ua or UA, t)
-    if cache_key in _HTTP_CACHE:
-        return _HTTP_CACHE[cache_key]
+    with _CACHE_LOCK:
+        if cache_key in _HTTP_CACHE:
+            return _HTTP_CACHE[cache_key]
     req = urllib.request.Request(url, headers={
         "User-Agent": ua or UA,
         "Accept": "application/rss+xml, application/atom+xml, application/xml, application/json, text/xml, */*",
@@ -811,23 +825,54 @@ def fetch_atom_arxiv(spec: dict, n: int) -> list[dict]:
 
 
 def _mirror_fetch(spec: dict, label: str) -> list[dict]:
-    """Try each mirror in order; return the first that yields a real feed.
+    """Fetch a mirrored source by RACING the mirrors concurrently.
 
-    Records which mirror won so the caller can report it (mirror health drifts).
+    为什么必须并行：实测 `baidu-hot` 配了 4 个镜像，其中 3 个已死
+    （1 个 403、2 个 DNS 失败），而串行 for 循环的**最坏情况是
+    4 × (3 次尝试 × TIMEOUT + 退避 2+4) = 4 × 81 = 324 秒**。
+    实测确实出现过一次 94 秒的全挂（另一代理记录）。一个热度榜源不该
+    主导整条管线的墙钟。
+
+    改成并发后：墙钟 ≈ 最慢的那个镜像，而不是所有镜像之和。
+    第一个返回非空结果的胜出；全部失败才报错（错误信息保留每个镜像的原因）。
+
+    `spec["mirror_timeout"]` 控制单个镜像的超时（默认 10s）——
+    热度榜是「有就有、没有就算了」的校准信号，不值得为它等 25 秒。
     """
     urls = spec.get("urls") or [spec["url"]]
-    errors = []
-    for url in urls:
+    per = spec.get("mirror_timeout", 10)
+    box: dict = {}
+
+    def _try(url: str) -> None:
         try:
-            entries = fetch_rss(url, label, spec.get("ua"))
-            if entries:
-                for entry in entries:
-                    entry["mirror"] = url
-                return entries
-            errors.append(f"{url}: empty")
-        except Exception as exc:  # noqa: BLE001 - try the next mirror
-            errors.append(f"{url}: {str(exc)[:60]}")
-    raise ValueError("all mirrors failed -> " + " | ".join(errors))
+            entries = fetch_rss(url, label, spec.get("ua"), "alternate", per)
+            if not entries:
+                box.setdefault("errors", []).append(f"{url}: empty")
+                return
+            for entry in entries:
+                entry["mirror"] = url
+            box["hit"] = entries
+        except Exception as exc:  # noqa: BLE001 - 别的镜像可能成功
+            box.setdefault("errors", []).append(f"{url}: {str(exc)[:60]}")
+
+    # ★ 不能用 `with ThreadPoolExecutor(...)` —— 它的 __exit__ 会 join 所有线程，
+    # 于是即便第一个镜像早就成功了，仍要等失败的镜像把重试跑完。实测：
+    # 拿到 51 条结果却仍耗 18.90s，等待的正是那三个已死镜像。
+    # 手动管理 executor 并在拿到结果后立即返回，剩下的线程让它自生自灭
+    # （进程很快结束，不值得为它们阻塞）。
+    pool = ThreadPoolExecutor(max_workers=len(urls))
+    try:
+        pending = {pool.submit(_try, u) for u in urls}
+        while pending and not box.get("hit"):
+            wait(pending, return_when=FIRST_COMPLETED)
+            pending = {f for f in pending if not f.done()}
+    finally:
+        # cancel_futures 让还没开跑的镜像直接取消；已在跑的无法中断，
+        # 但不再 join 它们 —— 这正是省下时间的地方。
+        pool.shutdown(wait=False, cancel_futures=True)
+    if box.get("hit"):
+        return box["hit"]
+    raise ValueError("all mirrors failed -> " + " | ".join(box.get("errors") or []))
 
 
 def fetch_google_trends(spec: dict, n: int) -> list[dict]:
@@ -1060,17 +1105,56 @@ def identity_of(source_key: str, label: str = "") -> str:
     if not name:
         return ""
     low = name.lower()
+    # ★ 两轮匹配：**先精确，再子串**。
+    # 实测 bug：只做子串匹配时，短别名会把长名字抢先匹配掉 ——
+    # `OUTLET_ALIAS` 里既有 `上游新闻`（裸形式）又有 `上游新闻客户端`（变体），
+    # 而 `上游新闻` 是 `上游新闻客户端` 的前缀，谁先谁后完全由表内顺序决定。
+    # 精确轮保证「名字就是表里那一项」时用最贴切的那条；
+    # 子串轮留给「名字里包含某个别名」的情形（如 `光明日报社`）。
+    for alias, canon in OUTLET_ALIAS:
+        if low == alias:
+            return canon
     for alias, canon in OUTLET_ALIAS:
         if alias in low:
             return canon
+    # 别名表没命中 → 通用归一去载体后缀。
+    # ★ 已登记的品牌（如 `上游新闻`）走的是上面那条：它们的所有写法
+    #   （`上游新闻客户端` / `上游新闻网` / `上游新闻新闻客户端`）都在
+    #   `_OUTLET_VARIANTS` 里显式登记，所以 100% 收敛。
+    #   通用规则只负责没登记的名字，因此它可以保持"激进但可预测"——
+    #   这也正是这个 bug 的教训：**别把品牌知识塞进通用后缀规则**，
+    #   两者的边界一模糊就会互相打架（前五版都栽在这里）。
     return normalize_identity(name)
+
+
+def _register_outlet_variants() -> None:
+    """把 `OUTLET_ALIAS` 里每个品牌的常见写法都登记上，形如 `X → X`。
+
+    为什么必须显式登记（而不是靠通用后缀剥离）：
+    `上游新闻` 与 `上游新闻客户端` 的差异在**品牌名内部**（「新闻」是品牌的一部分），
+    任何"剥载体重后缀"的通用规则都会在某一侧多剥或少剥：
+      多剥 → `上游新闻客户端` → `上游`，与裸形式 `上游新闻` 不收敛
+      少剥 → `新京报网` → `新京报网`，与裸形式 `新京报` 不收敛
+    实测通用规则在这组矩阵上最多只能做到 **9/15 收敛**（穷举 7 种候选规则验证过）。
+    显式登记是唯一能做到 15/15 且**意图可读**的办法 —— 表里写的是什么就是什么。
+    """
+    seen: set[str] = set()
+    for alias, canon in list(OUTLET_ALIAS):
+        base = alias.split("：")[0].split(":")[0].strip()
+        for form in (base + "客户端", base + "网", base + "新闻客户端"):
+            if form and form not in seen:
+                seen.add(form)
+                OUTLET_ALIAS.append((form, canon))
 
 
 # 真正的「同一家的不同写法」。**只有确实同属一个编辑部/通讯社的才进来。**
 # 判据：读者会认为这两条是「同一个来源」时才算合并。
 # 反例（明确不合并，虽然它们共用权重档）：新京报 ≠ 南方都市报、
 # 界面新闻 ≠ 财新、民政部 ≠ 财政部 —— 同档不等于同一家。
-OUTLET_ALIAS: tuple[tuple[str, str], ...] = (
+#
+# 类型是 `list`（不是 tuple）：`_register_outlet_variants()` 会往里追加
+# `X客户端 / X网 / X新闻客户端` 三种变体。调用必须在**这个定义之后**。
+OUTLET_ALIAS: list[tuple[str, str]] = [
     # 央视系统：一个台
     ("中央电视台", "cctv"), ("央视新闻", "cctv"), ("央视网", "cctv"),
     ("央视", "cctv"), ("cctv", "cctv"), ("新闻联播", "cctv"),
@@ -1094,20 +1178,98 @@ OUTLET_ALIAS: tuple[tuple[str, str], ...] = (
     ("第一财经", "yicai"), ("证券时报", "stcn"),
     ("it之家", "ithome"), ("ithome", "ithome"),
     ("36氪", "36kr"), ("36kr", "36kr"),
-)
+    # ── 品牌名【本身】必须登记（映射到自己）。
+    # ★ 这是本轮最关键的教训：曾经只登记 `X网` 变体而漏了裸品牌名，于是
+    #     `极目新闻`      → 别名未命中 → 通用剥离 → `极目新闻`
+    #     `极目新闻客户端` → 别名未命中 → 通用剥离 → **`极目`**
+    #       （一次性正则 `^(.+?)(?:新闻客户端|客户端|网)$` 的非贪婪 `.+?`
+    #        会把「新闻」吃进 `客户端` 分支，一步剥掉「新闻客户端」5 个字）
+    #   → 判成两家 → pickups=2、comm=0.60 → **单一媒体伪造进核心区**。
+    # 登记裸名后两条都走【精确匹配】，各自都落在 `极目新闻`，收敛。
+    #
+    # ★ 映射目标是【自己的身份】，不是权重桶 ——
+    #   新京报与南方都市报共用 `bjnews` 权重档，但它们是两家。
+    ("上游新闻", "上游新闻"), ("极目新闻", "极目新闻"), ("封面新闻", "封面新闻"),
+    ("界面新闻", "界面新闻"), ("红星新闻", "红星新闻"),
+    ("每日经济新闻", "每日经济新闻"), ("新京报", "新京报"),
+    ("南方都市报", "南方都市报"), ("财新", "财新"),
+    ("广州日报", "广州日报"), ("浙江日报", "浙江日报"), ("北京日报", "北京日报"),
+    ("中国青年报", "中国青年报"), ("南方周末", "南方周末"),
+    ("经济观察报", "经济观察报"), ("21世纪经济报道", "21世纪经济报道"),
+    ("观察者网", "观察者网"), ("环球时报", "环球时报"),
+    ("半月谈", "半月谈"), ("健康中国", "健康中国"),
+    # ── 机构网站的 `X网` 变体（裸名在上，变体交给自动注册补齐；这两条是
+    #    名字本身不以品牌结尾的特例，必须手写）
+    ("南方周末网", "南方周末"), ("经济观察网", "经济观察报"),
+    ("21世纪经济报道网", "21世纪经济报道"), ("每日经济新闻网", "每日经济新闻"),
+]
+
+# 必须在 OUTLET_ALIAS 定义【之后】调用（初版放在定义前 → NameError）。
+_register_outlet_variants()
 
 
 def normalize_identity(text: str) -> str:
-    """Strip generic suffixes so two spellings of one outlet compare equal.
+    """Strip CARRIER suffixes so two spellings of one outlet compare equal.
 
-    「新闻」**不在**剥离列表里。实测：「界面新闻」→「界面」、「封面新闻」→「封面」
-    都是把一个真品牌名砍成半截 —— 而「新闻」是这两个名字的一部分，不是后缀。
-    只剥那些明确表示「同一家的另一种载体」的词（网站/客户端/官网）。
+    ★ 只剥**纯载体**后缀：`客户端 / 官网 / 官方网站 / 网站`。
+    `新闻网` 和单字 `网` **都不剥** —— 这是踩过两次的坑：
+
+      坑一（原始 bug，5 个版本复现，E2E 能伪造进核心区）：
+        后缀表里 `新闻客户端` 剥掉 5 个字，`上游新闻客户端` → `上游`，
+        而裸形式是 `上游新闻` → 判成两家 → pickups=2、comm=0.60
+        → **单一媒体伪造进核心区**。13 组里 7 组中招。
+        当时 docstring 明写「「新闻」不在剥离列表里」—— **注释与代码直接矛盾**。
+
+      坑二（修坑一时引入）：为了收敛，改成反复剥到不动、并把 `网` 也剥掉。
+        但 `上游新闻` 结尾的 `新闻` 里的 `闻` 不是后缀，而 `新闻网` 剥完剩
+        `上游新闻`、再剥单字 `网` 又变成 `上游` —— **两条路径仍然不收敛**，
+        而且 `新京报网` → `新京报` 对、`上游新闻网` → `上游` 错，规则自相矛盾。
+
+    最终做法：`网` 一律不动，`X报网` / `X新闻客户端` 这类**品牌相关的变体**
+    交给 `OUTLET_ALIAS` 显式登记 —— 别名表就是干这个的，
+    而通用后缀剥离只处理与之无关的纯载体词。
     """
     out = re.sub(r"[\s·・\-_（）()【】\[\]]+", "", (text or "").lower())
-    for suffix in ("新闻客户端", "客户端", "新闻网", "官网", "官方网站", "网站"):
-        if out.endswith(suffix) and len(out) > len(suffix) + 1:
-            out = out[: -len(suffix)]
+    # 三个约束，缺一个就有真实品牌被判成两家（每一版都在这里翻车，全记下来）：
+    #
+    #   ① 必须【反复试到不动】。`新京报客户端` 一轮只剥一次：
+    #      先试 `新闻客户端`（不匹配）→ 再试 `客户端` → `新京报` ✓
+    #      但 `新京报新闻客户端` 先剥 `客户端` → `新京报新闻`，
+    #      必须回头再试一次才能收敛。单趟 for 循环不够。
+    #
+    #   ② `新闻客户端` 必须排在 `客户端` 前面。否则 `上游新闻客户端`
+    #      先剥 `客户端` → `上游新闻`（恰好正确，但纯属运气）；
+    #      换成 `上游新闻新闻客户端` 就会剩下 `上游新闻新闻`。
+    #
+    #   ③ 混用「新闻」的复合后缀（如 `新闻网`）会与品牌名里的「新闻」打架：
+    #      `上游新闻网` 剥 `新闻网` → `上游`，与裸形式 `上游新闻` 不收敛。
+    #      所以后缀表里**只有 `新闻客户端`** 含「新闻」，它是无歧义的
+    #      （没有品牌叫 `X新闻新闻客户端`）。
+    #
+    # 不再剥 `官网/官方网站/网站`：它们不影响任何实测用例，
+    # 而每多一条规则就多一次上面这类互相打架的机会。需要时用 OUTLET_ALIAS 登记。
+    out = re.sub(r"[\s·・\-_（）()【】\[\]]+", "", (text or "").lower())
+    # ── 规则（前五版都在这里翻车，把推导钉死，别再靠猜）──────────────────
+    # 目标：X = X客户端 = X网 = X新闻客户端，且 X新闻 = X新闻客户端
+    #       收敛（绝不能把品牌名里的「新闻」剥掉）。
+    #
+    # ★ 核心：**只剥一个后缀就停**，用一次性正则，不用循环。
+    #   循环是罪魁 —— 它一旦启动就一路剥穿品牌名：
+    #     `上游新闻客户端` → 剥 `客户端` → `上游新闻` → 循环再剥 → `上游` ✗
+    #   而裸形式 `上游新闻` 没有可剥的载体重后缀，停在 `上游新闻` → 判成两家。
+    #   实测 6 组失败全部出在这个循环上。
+    #
+    # ★ 后缀按**长度降序**排列，正则交替分支**从左到右**匹配：
+    #     `新闻客户端`(5) 先于 `客户端`(3) 先于 `网`(1)
+    #   于是 `新京报新闻客户端` 剥 5 字 → `新京报`（一轮到位，不需要循环）。
+    #
+    # ★ 后缀表里**不能有 `新闻网`**：`上游新闻网` 剥 `新闻网` → `上游`，
+    #   与裸形式 `上游新闻` 不收敛。单字 `网` 才是对的（→ `上游新闻`）。
+    #
+    # 不再剥 `官网/官方网站/网站`：不影响任何实测用例，
+    # 而每多一条规则就多一次互相打架的机会。需要时用 OUTLET_ALIAS 登记。
+    # 守卫 `.+` 保证剥完至少剩 1 个字符（`网` 单独出现时不会被剥成空串）。
+    out = re.sub(r"^(.+?)(?:新闻客户端|客户端|网)$", r"\1", out)
     return out
 
 
@@ -1420,6 +1582,50 @@ def evidence_form_of(entry: dict) -> str:
     if score >= 1:
         return "secondary-report"
     return "unattributed"
+
+
+# 修饰词与感叹号：**它们是偏见检测信号，不是噪声。**
+#
+# skill 的硬规则是「修饰词和感叹号不要过滤掉 —— 放进 signal_words，同时不进 claim」。
+# 实测问题：这条规则此前**完全落空** —— 抓取路径（RSS / Crossref / atom）
+# 一个字都不往 `signal_words` 里写，该字段只由调用方的 `--extra-json` 注入。
+# 实测 193 条里 0 条有值。规则写在文档里、代码里没有对应实现，等于没有。
+#
+# 抽的是**报道者的判断痕迹**：程度词、评价性形容词、情绪化表达、感叹号。
+# 不做褒贬分类 —— 只标出「这里有主观色彩」，让下游自己去质疑。
+RE_SIGNAL_ZH = re.compile(
+    r"(?:极为|极其|极度|彻底|完全|根本|重大|巨大|显著|大幅|急剧|飞速|迅猛|空前"
+    r"|首次|唯一|史上|最[高新强大低快慢多]|突破性|颠覆性|革命性|里程碑"
+    r"|震惊|震撼|重磅|爆|惊[人呆]|罕见|惊人|可怕|恐怖|惨|悲剧"
+    r"|令人|不禁|竟然|居然|万万没想到|不可思议|难以置信"
+    r"|必将|势必|无疑|显然|众所周知|众所周知)"
+    r"|！+|!{2,}")
+RE_SIGNAL_EN = re.compile(
+    r"\b(?:unprecedented|breakthrough|revolutionary|disruptive|game.?chang\w*"
+    r"|groundbreaking|stunning|shocking|devastating|catastrophic|massive|huge"
+    r"|dramatic\w*|drastically|dramatically|significantly|substantially|nearly"
+    r"|unprecedented|definitively|unequivocally|remarkabl\w+|extraordinarily"
+    r"|first-ever|record-breaking|scary|terrifying|alarming)\b"
+    r"|!{2,}", re.I)
+
+
+def signal_words(entry: dict, limit: int = 8) -> list[str]:
+    """从标题+摘要里抽出报道者的判断痕迹，原样保留。
+
+    返回原文片段（不改写），去重、按出现顺序，最多 `limit` 个。
+    **不进 claim** —— 调用方负责把它们放在 claim 之外。
+    """
+    blob = " ".join([entry.get("title") or "", entry.get("summary") or ""])
+    seen, out = set(), []
+    for rx in (RE_SIGNAL_ZH, RE_SIGNAL_EN):
+        for m in rx.finditer(blob):
+            w = m.group(0)
+            k = w.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(w)
+    return out[:limit]
 
 
 TREND_TRUTH_CAP = 0.45
@@ -2219,18 +2425,36 @@ def main() -> int:
         kws = intent_keywords(args.request or "", args.keywords)
         rel = keyword_coverage(kws, items)
         rel["threshold"] = args.relevance_min
-        rel["needs_second_pass"] = rel["coverage"] < args.relevance_min
-        print(f"关联度复检（对 {rel['entries_checked']} 条萃取结果）")
-        print(f"  覆盖 {rel['coverage']} / 阈值 {rel['threshold']}  "
-              f"[{'需二次搜寻' if rel['needs_second_pass'] else 'OK'}]")
-        print(f"  命中  : {', '.join(rel['matched']) or '无'}")
-        print(f"  未覆盖: {', '.join(rel['missing']) or '无'}")
-        if rel["needs_second_pass"]:
-            print("  -> 换检索角度/换关键词重跑，然后重新复核权重。不许直接出结论。")
+        # 无关键词时 coverage 是 None（不是 1.0）—— 见 keyword_coverage 的注释。
+        # 这里必须显式处理，否则 `None < 0.6` 会 TypeError。
+        if rel.get("checked") is False:
+            rel["needs_second_pass"] = False
+            print(f"关联度复检（对 {rel['entries_checked']} 条萃取结果）")
+            print(f"  未检查 —— {rel.get('note','')}")
+            print("  -> 要给 --keywords 才能量；不要把它读成通过。")
+        else:
+            rel["needs_second_pass"] = rel["coverage"] < args.relevance_min
+            print(f"关联度复检（对 {rel['entries_checked']} 条萃取结果）")
+            print(f"  覆盖 {rel['coverage']} / 阈值 {rel['threshold']}  "
+                  f"[{'需二次搜寻' if rel['needs_second_pass'] else 'OK'}]")
+            print(f"  命中  : {', '.join(rel['matched']) or '无'}")
+            print(f"  未覆盖: {', '.join(rel['missing']) or '无'}")
+            if rel["needs_second_pass"]:
+                print("  -> 换检索角度/换关键词重跑，然后重新复核权重。不许直接出结论。")
         if args.out:
             pathlib.Path(args.out).write_text(
                 json.dumps({"relevance": rel}, ensure_ascii=False, indent=2),
                 encoding="utf-8")
+            # --compact 在这条路径上曾是【静默失效】：check-json 提前 return 0，
+            # 走不到写 compact 的那段，于是 exit 0、全量写了、_compact.json
+            # 根本不存在，而文档把 --compact 列为「必加参数」。
+            # 要么写出来，要么明说写不了 —— 不能什么都不做还报成功。
+            if args.compact:
+                print("warning: --check-json 路径不产出抓取条目，--compact 无意义，已忽略",
+                      file=sys.stderr)
+        elif args.compact:
+            print("warning: --compact 需要配合 --out 才会写精简视图，已忽略",
+                  file=sys.stderr)
         return 0
 
     # ---- source selection ----
@@ -2637,6 +2861,15 @@ def main() -> int:
                                   "低于 0.6 闸门，因此落在【丢弃】区，不作事实依据；"
                                   "条目本身仍保留在 JSON 里可查")
 
+        # 修饰词与感叹号：抓取路径以前一字不写，实测 193 条里 0 条有值 ——
+        # skill 的硬规则「修饰词和感叹号不要过滤掉」在代码里没有对应实现。
+        # 在这里统一补上（所有来源路径都经过这个循环）。
+        # 调用方通过 --extra-json 已经给过的，尊重它，不覆盖。
+        if not entry.get("signal_words"):
+            sw = signal_words(entry)
+            if sw:
+                entry["signal_words"] = sw
+
         entry["pickups"] = pickups
         entry["trend_boards"] = trend_saturation(entry)
         entry["corroborated_by"] = sorted(others)
@@ -2903,19 +3136,38 @@ def main() -> int:
             dead = sorted(k for k in want
                           if (funnel.get(k) or {}).get("fetched", 0) > 0
                           and (funnel.get(k) or {}).get("emitted", 0) == 0)
+            # ★ 「返回 0 条」与「零产出」是两回事，但都属于覆盖缺口。
+            # 实测：crossref-sciadv / lancet / cell / natbiotech 四个源返回 0 条，
+            # 既不进 degraded（status=ok）也不进 zero_yield（要求 fetched>0），
+            # 于是权威面 13 个源里 4 个空转而「本次覆盖」看不出来。
+            # 0 条有两种原因（期刊本周没新文章 vs 接口坏了），报告只需如实列出，
+            # 由人判断 —— 隐去才是最坏的选择。
+            empty = sorted(r["source"] for r in ok_rows if not (r.get("count") or 0))
             failing = sorted(r["source"] for r in rows if r["status"] != "ok")
+            gaps = {}
+            if failing:
+                gaps["failed_sources"] = failing
+            if dead:
+                gaps["zero_yield_sources"] = dead
+            if empty:
+                gaps["returned_zero_sources"] = empty
             if len(ok_rows) < len(want):
                 degraded.append({"stream": cls_name,
                                  "reason": f"该路有源失败（{n_ok}/{n_total} 来源可用）",
                                  "attempted": n_total, "succeeded": n_ok,
-                                 "entries": got_n, "failed_sources": failing,
+                                 "entries": got_n,
                                  **({"injected_extras": len(ext_rows)} if ext_rows else {}),
-                                 **({"zero_yield_sources": dead} if dead else {})})
-            elif dead:
+                                 **gaps})
+            elif dead or empty:
+                why = []
+                if dead:
+                    why.append(f"抓到了但一条没落地：{','.join(dead)}")
+                if empty:
+                    why.append(f"返回 0 条：{','.join(empty)}")
                 degraded.append({"stream": cls_name,
-                                 "reason": f"该路有源零产出（抓到了但一条没落地：{','.join(dead)}）",
+                                 "reason": "该路有源无贡献（" + "；".join(why) + "）",
                                  "attempted": n_total, "succeeded": n_ok,
-                                 "entries": got_n, "zero_yield_sources": dead})
+                                 "entries": got_n, **gaps})
 
     result = {
         "generated_at": now.isoformat(),
@@ -3010,8 +3262,14 @@ def main() -> int:
                   + (f" | ≥5s 的源: " +
                      ", ".join(f"{r['source']}={r['seconds']}s" for r in slow)
                      if slow else ""))
+        # external 的窗口丢弃数必须一起报。实测：反向测试里控制台显示 0，
+        # 而 JSON 里 `external_dropped_out_of_window` 是 3 —— 控制台与 JSON 对
+        # 同一件事给出不同答案，读控制台的人会以为一条没丢。
+        _ext_drop = result["stats"].get("external_dropped_out_of_window") or 0
         print(f"  entries      : {result['stats']['kept']} kept / {result['stats']['raw']} raw "
-              f"({dropped} out-of-window, {undated} undated, "
+              f"({dropped} out-of-window"
+              + (f" + {_ext_drop} external out-of-window" if _ext_drop else "")
+              + f", {undated} undated, "
               f"{result['stats']['duplicates_merged']} duplicates merged, "
               f"{errata_dropped} errata dropped, "
               f"{overflow} over per-source cap)")
