@@ -106,13 +106,86 @@ Crossref 按「出版日期」排会漏掉大刊全部新文章（它们的期�
 
 **每一路都带上 `--domain <阶段1判断的类>`。**
 
+### ⚠️ 两个必加的参数（省一半读入量）
+
+```bash
+--compact           # 同时写 <out>_compact.json
+--out "$env:TEMP\..."   # 必须写文件，Windows 控制台是 GBK
+```
+
+**子代理和主窗口读的是 `_compact.json`，不是全量那份。**
+
+| 文件 | 体积（实测一次三路运行） | 给谁读 |
+|---|---|---|
+| `<out>.json` | **320 KB** | 别读。只在需要回查被截断的摘要时用 |
+| `<out>_compact.json` | **158 KB** | **✅ 读这份** |
+
+精简视图去掉了**能从其他字段推导出来的**键（`weights` 是 1.7 KB 常量每条运行重复一遍、`published_raw`、`also_titles`、`also_event_ids`），并把超长摘要截到 600 字并标 `summary_cut`（值为原文全长）。
+
+**判断需要的字段一个没删**：分数、分区、证据类型、`event_id`、来源、独立转载、风险标记、审计理由、`sources_report`、`source_funnel`、`degraded_streams` 全部保留。
+
+> **为什么要标 `summary_cut`**：不标的话下游会以为拿到的是全文。
+> **省 token 不能以「让人误以为看到了全文」为代价** —— 那比多读 160 KB 危险。
+
+### 逐源耗时（新增，用来看哪一路被拖住）
+
+脚本现在每次运行都打印：
+
+```
+耗时 : 合计 6.5s | 最慢 ithome 1.95s | ≥5s 的源: reddit-ml=12.58s
+```
+
+每个源的秒数也写进 `sources_report[].seconds`。
+
+> ⚠️ **`合计` 是「各源耗时之和」，不是并行墙钟。**
+> `fetch_feeds.py` **纯串行**（`for key in keys:` 单循环，无 Thread / Pool / asyncio）。
+> 所以「合计」≈ 墙钟 —— 它就是墙钟的分解。
+> **不要把它当并行加速后的数字。**（我一度声称「三路并行把墙钟从 37s 降到 20s」，
+> 那是错的。三路之间并行是**子代理调度**带来的，与脚本内部无关。）
+
+**实测全部 30 个源各跑 3 次的最大值**：
+
+| 源 | 最大 | 中位 | 说明 |
+|---|---|---|---|
+| `arxiv-ai` | **11.29s** | 9.43s | 合法慢：4 个分类各一次请求 + `ARXIV_GAP=3s` 礼貌间隔 |
+| `reddit-ml` | 7.35s | 6.89s | 全在等退避（429），0 条 |
+| 其余 28 个 | **均 < 4.8s** | | |
+
+> **两条互为反向的教训，都要记住：**
+>
+> **① 最慢的源需要的是【更大的】超时，不是更小的。** `arxiv-ai` 在 4 分类下耗时
+> ≈ 9.4 + 3×3 = 18.4s，全局 `TIMEOUT=25s` 余量很小，网络稍慢就会
+> **截断合法的分类数据**。已给它单独设 **40s**。
+>
+> **② 单次测量会骗人，不要据此压超时。** `ithome` 第一次测出 **14.25s**，
+> 复测 4 次是 `1.05 / 2.08 / 2.17 / 1.99`（中位 **1.99s**）—— 那个 14s 是瞬时抖动。
+> 按单次测量给它压低超时，会真的造成丢数据。
+>
+> `reddit-ml` **故意不设超时**：它现在稳定 429，但那是限流不是响应时间，
+> 按限流耗时设超时会反过来切断它恢复后的正常响应。**没有可靠数字就不设。**
+
+### ⚠️ `seconds` 会因 HTTP 缓存失真
+
+`_get()` 有进程内缓存，缓存键是 `(url, ua, timeout)`。
+`hn-frontpage` 与 `hn-top` 这三个值**完全相同**，所以同进程内后抓的那个记 **0.0s**
+（实测；单独抓是 0.58s）。
+
+**`seconds` 是「抓取或命中缓存」的延迟，不是该源的网络成本。** 要测真实成本就单源单独跑。
+
+
+### 退避已缩短
+
+`RETRY_WAITS` 从 `(4.0, 12.0)` 改成 `(2.0, 4.0)`。
+理由：429 是"这个源此刻不给数据"，多等 12 秒不会让它给 —— 实测 `reddit-ml` 单源耗 **17.06s，其中 16s 纯 sleep**。
+
+
 ### 路 A · 子代理「社会面」
 
 **负责**：热度、风向、爆料、传言、社区反应、行业八卦。
 **它的活**：快。抓的是**「大家在说什么」**，不是「事实是什么」。
 
 ```bash
-python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per-source 15 --out "$env:TEMP\radar_social.json"
+python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per-source 15 --compact --out "$env:TEMP\radar_social.json"
 ```
 
 **子代理提示词模板**（照抄，替换 `<DOM>` / `<主题>` / `<天数>`）：
@@ -120,7 +193,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per
 > 你是情报管线的**社会面**采集员。分类：`<DOM>`。主题：`<主题>`。时间窗：近 `<天数>` 天。
 >
 > 执行：
-> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class social --days <天数> --max-per-source 15 --out "$env:TEMP\radar_social.json"`，
+> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class social --days <天数> --max-per-source 15 --compact --out "$env:TEMP\radar_social.json"`，
 >    然后读该 JSON（不要读原文页，除非某条必须核对）。
 > 2. 若不足以覆盖主题，用 `web_search` 补 2–4 次查询，**检索词带年份月份**。
 > 3. 从结果里挑出**最多 12 条**，按下面契约返回。
@@ -163,7 +236,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class social --days <N> --max-per
 **它的活**：慢但准。抓的是**「什么是真的」**。
 
 ```bash
-python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-per-source 15 --out "$env:TEMP\radar_auth.json"
+python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-per-source 15 --compact --out "$env:TEMP\radar_auth.json"
 ```
 
 **子代理提示词模板**：
@@ -171,7 +244,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-
 > 你是情报管线的**权威面**采集员。分类：`<DOM>`。主题：`<主题>`。时间窗：近 `<天数>` 天。
 >
 > 执行：
-> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class authority --days <天数> --max-per-source 15 --out "$env:TEMP\radar_auth.json"`，然后读该 JSON。
+> 1. 跑 `python scripts/fetch_feeds.py --domain <DOM> --class authority --days <天数> --max-per-source 15 --compact --out "$env:TEMP\radar_auth.json"`，然后读该 JSON。
 > 2. 补充：`web_search` 找该领域官方公告 / 机构发布（检索词带年份月份）。
 > 3. 对**确定要进核心区的 1–3 条**用 `web_fetch` 读正文，核对数字与结论。
 >
@@ -209,7 +282,7 @@ python scripts/fetch_feeds.py --domain <DOM> --class authority --days <N> --max-
 **在子代理跑的时候做，不要等。**
 
 ```bash
-python scripts/fetch_feeds.py --class trend --max-per-source 15 --out "$env:TEMP\radar_trend.json"
+python scripts/fetch_feeds.py --class trend --max-per-source 15 --compact --out "$env:TEMP\radar_trend.json"
 ```
 
 （热度榜**不分三大类** —— 它衡量的是全体公众的注意力。）

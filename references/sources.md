@@ -20,8 +20,8 @@
 
 ```bash
 python scripts/fetch_feeds.py --list                                   # 看全部三类归属
-python scripts/fetch_feeds.py --domain science --class authority --days 3 --out "$env:TEMP\a.json"
-python scripts/fetch_feeds.py --domain ai --days 3 --out "$env:TEMP\a.json"     # 整类
+python scripts/fetch_feeds.py --domain science --class authority --days 3 --compact --out "$env:TEMP\a.json"
+python scripts/fetch_feeds.py --domain ai --days 3 --compact --out "$env:TEMP\a.json"     # 整类
 ```
 
 一个源可属于多类（`ars-technica` 三类都算），所以三个数加起来大于总数。
@@ -47,9 +47,9 @@ python scripts/fetch_feeds.py --domain ai --days 3 --out "$env:TEMP\a.json"     
 | `trend` | **主窗口**（热度榜） | 按热度排序。**不是内容源，是校准工具** | 5 |
 
 ```bash
-python scripts/fetch_feeds.py --class authority --domain science --days 3 --out "$env:TEMP\auth.json"
-python scripts/fetch_feeds.py --class social    --domain ai      --days 3 --out "$env:TEMP\social.json"
-python scripts/fetch_feeds.py --class trend                                 --out "$env:TEMP\trend.json"
+python scripts/fetch_feeds.py --class authority --domain science --days 3 --compact --out "$env:TEMP\auth.json"
+python scripts/fetch_feeds.py --class social    --domain ai      --days 3 --compact --out "$env:TEMP\social.json"
+python scripts/fetch_feeds.py --class trend --compact                                 --out "$env:TEMP\trend.json"
 ```
 
 > **实测教训（这个 bug 很隐蔽）**：`social` **既是域名也是类名**。

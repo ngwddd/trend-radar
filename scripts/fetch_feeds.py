@@ -39,7 +39,10 @@ for _stream in (sys.stdout, sys.stderr):
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 TIMEOUT = 25
 RETRY_STATUS = {429, 500, 502, 503, 504}
-RETRY_WAITS = (4.0, 12.0)      # backoff between attempts
+# 退避曾经是 (4.0, 12.0) —— 实测代价：reddit-ml 撞 429 后单源耗 17.06s，
+# 其中 16s 纯粹在 sleep。而 429 是"这个源此刻不给数据"，多等 12 秒并不会
+# 让它给。缩短到 (2.0, 4.0)：仍给瞬时抖动一次机会，但不再为确定性拒绝付 16 秒。
+RETRY_WAITS = (2.0, 4.0)
 ARXIV_GAP = 3.0                # polite gap between arXiv API calls
 
 
@@ -650,14 +653,20 @@ def _parse_date(value: str | None) -> datetime | None:
     return None
 
 
-def _get(url: str, *, retries: int = 0, ua: str | None = None) -> bytes:
+def _get(url: str, *, retries: int = 0, ua: str | None = None,
+         timeout: int | None = None) -> bytes:
     """GET with optional retry on rate-limit / transient 5xx.
 
     Responses are memoized per process: several registry entries legitimately
     share one endpoint (reddit-ml and reddit-ml-top are the same URL), and
     fetching it twice got us HTTP 429 on the second call.
+
+    `timeout` lets a single source override the global one. Measured need:
+    sources differ by two orders of magnitude (ithome 14.2s vs techreview 0.13s),
+    and one slow source used to delay every source after it in the same stream.
     """
-    cache_key = (url, ua or UA)
+    t = timeout or TIMEOUT
+    cache_key = (url, ua or UA, t)
     if cache_key in _HTTP_CACHE:
         return _HTTP_CACHE[cache_key]
     req = urllib.request.Request(url, headers={
@@ -668,7 +677,7 @@ def _get(url: str, *, retries: int = 0, ua: str | None = None) -> bytes:
     attempt = 0
     while True:
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT, context=SSL_CONTEXT) as resp:
+            with urllib.request.urlopen(req, timeout=t, context=SSL_CONTEXT) as resp:
                 body = resp.read()
                 _HTTP_CACHE[cache_key] = body
                 return body
@@ -754,12 +763,19 @@ def parse_feed(payload: bytes, label: str, link_prefer: str = "alternate") -> li
                 authors.append((name.text if name is not None and name.text else child.text) or "")
             elif _tag(child) == "creator" and child.text:
                 authors.append(child.text)
+        # `summary_truncated` 之前【只在 Crossref 路径】设置（见 fetch_crossref），
+        # 于是 RSS 路径上被 _clip 截过的条目没有任何标记 —— 实测 16 条
+        # （ieee-spectrum 最多，一条省了 7618 字）。同一个动作两条路径两套记账，
+        # 下游就无法统一判断「这条摘要是不是完整的」。
+        _sum_raw = _strip_html(summary)
+        _sum_clipped = _clip(_sum_raw)
         out.append({
             "title": _strip_html(title),
             "url": _entry_link(item, link_prefer),
             "published_raw": published,
             "published": (_parse_date(published).isoformat() if _parse_date(published) else None),
-            "summary": _clip(_strip_html(summary)),
+            "summary": _sum_clipped,
+            "summary_truncated": len(_sum_raw) > len(_sum_clipped),
             "authors": [a for a in authors if a][:4],
             "source_label": label,
         })
@@ -767,8 +783,8 @@ def parse_feed(payload: bytes, label: str, link_prefer: str = "alternate") -> li
 
 
 def fetch_rss(url: str, label: str, ua: str | None = None,
-              link_prefer: str = "alternate") -> list[dict]:
-    payload = _get(url, retries=2, ua=ua)
+              link_prefer: str = "alternate", timeout: int | None = None) -> list[dict]:
+    payload = _get(url, retries=2, ua=ua, timeout=timeout)
     head = payload[:400].lstrip().lower()
     if head.startswith(b"<!doctype html") or b"<html" in head:
         raise ValueError("returned HTML, not a feed (bot wall / consent page)")
@@ -988,12 +1004,25 @@ SYNDICATION_PARENT = {
 def identity_of(source_key: str, label: str = "") -> str:
     """Resolve a registry key OR a free-text outlet name to ONE identity.
 
-    Measured failures this prevents (self-corroboration):
-      - an external entry whose `also_seen_in` named its OWN source counted itself
-        as an independent reprint, taking pickups 1 -> 2 and comm 0.35 -> 0.60 --
-        exactly across the gate;
-      - '中国新闻网' and '中新社' counted as two outlets when they are one wire;
-      - '央视新闻' and '央视网' likewise.
+    ★ 这个函数回答的是「**是不是同一家媒体**」，不是「**属于哪一档权重**」。
+    两者必须分开，因为一个权重档里装着很多家不同的媒体。
+
+    Measured failures, in BOTH directions -- the same alias table was doing both
+    jobs and got each one wrong in turn:
+
+      假阳性（同一家算多家）: an external entry whose `also_seen_in` named its OWN
+        source counted itself as an independent reprint, taking pickups 1 -> 2 and
+        comm 0.35 -> 0.60, exactly across the gate.
+
+      假阴性（多家算一家）: 修上面那个时改成返回 `platform_of()` 的结果，而那是
+        **权重桶**。实测 16 组独立媒体对了 11 组：新京报 + 南方都市报 → 都是
+        `bjnews`；广州日报 + 北京日报 → `bjnews`；界面新闻 + 财新 → `caixin`；
+        新华社 + 中新社 → `xinhua`；民政部 + 财政部 → `gov-cn`（30 个部委全塌成
+        一个）。后果相反但同样致命：**真实的多源印证被吞掉**，一条真的被多家
+        报道的新闻 pickups 永远等于 1，comm 卡在 0.35 进不了核心区。
+
+    修法：身份 = 归一化后的**媒体名**，只有 OUTLET_ALIAS 里明确列出的
+    「确实是同一家的不同写法」才合并。权重桶只用于查 PLATFORM_WEIGHT。
     """
     if source_key:
         mapped = SOURCE_IDENTITY.get(source_key) or SYNDICATION_PARENT.get(source_key)
@@ -1004,14 +1033,47 @@ def identity_of(source_key: str, label: str = "") -> str:
     name = (label or source_key or "").strip()
     if not name:
         return ""
-    pk = platform_of("", name)
-    return normalize_identity(name) if pk == "unknown" else pk
+    low = name.lower()
+    for alias, canon in OUTLET_ALIAS:
+        if alias in low:
+            return canon
+    return normalize_identity(name)
+
+
+# 真正的「同一家的不同写法」。**只有确实同属一个编辑部/通讯社的才进来。**
+# 判据：读者会认为这两条是「同一个来源」时才算合并。
+# 反例（明确不合并，虽然它们共用权重档）：新京报 ≠ 南方都市报、
+# 界面新闻 ≠ 财新、民政部 ≠ 财政部 —— 同档不等于同一家。
+OUTLET_ALIAS: tuple[tuple[str, str], ...] = (
+    # 央视系统：一个台
+    ("中央电视台", "cctv"), ("央视新闻", "cctv"), ("央视网", "cctv"),
+    ("央视", "cctv"), ("cctv", "cctv"), ("新闻联播", "cctv"),
+    # 新华社系统：一个通讯社
+    ("新华社", "xinhua"), ("新华网", "xinhua"), ("新华每日电讯", "xinhua"),
+    ("中新社", "xinhua"), ("中国新闻网", "xinhua"), ("中新网", "xinhua"),
+    # 人民日报社：一张报纸及其网站
+    ("人民日报", "people"), ("人民网", "people"),
+    # 央广/国际台
+    ("中央广播电视总台", "cctv"), ("央广网", "cnr"), ("央广", "cnr"),
+    # 其它单点别名（同一品牌的写法差异）
+    ("澎湃新闻", "thepaper"), ("澎湃", "thepaper"),
+    ("光明网", "guangming"), ("光明日报", "guangming"), ("光明", "guangming"),
+    ("中国日报", "chinadaily"),
+    ("第一财经", "yicai"), ("证券时报", "stcn"),
+    ("it之家", "ithome"), ("ithome", "ithome"),
+    ("36氪", "36kr"), ("36kr", "36kr"),
+)
 
 
 def normalize_identity(text: str) -> str:
-    """Strip generic suffixes so two spellings of one outlet compare equal."""
+    """Strip generic suffixes so two spellings of one outlet compare equal.
+
+    「新闻」**不在**剥离列表里。实测：「界面新闻」→「界面」、「封面新闻」→「封面」
+    都是把一个真品牌名砍成半截 —— 而「新闻」是这两个名字的一部分，不是后缀。
+    只剥那些明确表示「同一家的另一种载体」的词（网站/客户端/官网）。
+    """
     out = re.sub(r"[\s·・\-_（）()【】\[\]]+", "", (text or "").lower())
-    for suffix in ("新闻客户端", "客户端", "新闻网", "新闻", "官网", "官方", "网站", "网"):
+    for suffix in ("新闻客户端", "客户端", "新闻网", "官网", "官方网站", "网站"):
         if out.endswith(suffix) and len(out) > len(suffix) + 1:
             out = out[: -len(suffix)]
     return out
@@ -1703,13 +1765,14 @@ def event_id(title: str) -> str:
 def entity_id(name: str) -> str:
     """Canonical identity for an outlet/organisation name, for cross-checking.
 
-    Wraps platform_of + normalize_identity so that '央视新闻' / '央视网' / 'cctv'
-    and '中新社' / '中国新闻网' / 'xinhua' each collapse to one id.
+    ★ 这个函数**必须**委托给 identity_of —— 两个函数回答的是同一个问题。
+    实测教训：修 identity_of 的过归一 bug 时（它曾返回 platform_of 的**权重桶**，
+    导致新京报/南方都市报被判同一家、真实多源印证被吞），只改了 identity_of，
+    entity_id 留着自己的 `platform_of(...)` 副本。于是补的 7 条
+    「不应合并」断言全部失败 —— **测试抓到了不完整修复，这正是它该做的。**
+    修法：删掉副本，只保留一个实现。
     """
-    if not name or not str(name).strip():
-        return ""
-    pk = platform_of("", str(name))
-    return pk if pk != "unknown" else normalize_identity(str(name))
+    return identity_of("", str(name or ""))
 
 
 # 广告标记分两类，因为【位置】决定含义：
@@ -1864,6 +1927,153 @@ def keyword_coverage(keywords: list[str], entries: list[dict],
             "missing": missing, "entries_checked": len(entries)}
 
 
+def compact_view(result: dict, summary_chars: int = 600) -> dict:
+    """下游要读的那份：去掉推导得出的冗余，摘要按字数截断。
+
+    实测必要性：一次三路运行写出 320 KB JSON，而**子代理要把全量读进上下文**。
+    逐字段测下来，成本几乎全在 `summary`（均 1031 B/条 / 占 90%），
+    其余是 `weights`（1.7 KB 常量，每条运行重复一遍）、`published_raw`、
+    `also_titles` / `also_event_ids`（合并兄弟条目，判断同事件用 `event_id` 就够）。
+
+    ⚠️ `published_raw` **不是可推导的** —— 它含时刻（`16:24:26`），而 `published`
+    被归一化到午夜。删它是为了省 token 的取舍，不是因为它冗余。需要精确时刻时
+    读全量那份。（第一版 docstring 把这点说反了，实测 45 条里有 15 条受影响。）
+
+    保留原则：**凡是「判断需要」的字段一个不删** —— 分数、分区、证据类型与
+    **证据形式**、事件 id、来源、独立转载、风险标记、审计理由全部保留。
+    **风险标记哪怕值是 `false` 也保留**：`promotional_signal: false` 意思是
+    「检查过、没有导购信号」，删掉它下游就分不清「没有」和「没查」。
+    """
+    keep = ("title", "url", "published", "summary", "summary_cut", "summary_truncated",
+            "authors",
+            "source_key", "source_label", "source_identity", "source_status",
+            "evidence_type", "reconciliation", "event_id", "score_source",
+            "truth_score", "comm_score", "pickups", "section", "gate_note",
+            "passes_truth", "passes_comm", "passes_gate",
+            "also_seen_in", "corroborated_by",
+            "promotional_signal", "promo_body_hit", "promo_note",
+            "trend_capped", "body_missing", "body_note",
+            "record_alert", "retraction", "front_matter", "front_matter_reason",
+            "doi", "is_trend", "signal_words", "elements", "in_window",
+            "update_notices")
+    # 值为 False / 0 也必须保留的键。实测：省略逻辑用 falsy 通杀，于是
+    # `promotional_signal: false` 被删掉 —— 230 条全部评估过、compact 里 0 条保留，
+    # 下游**无法区分「检查过、没有导购信号」和「根本没做这项检查」**。
+    # 「缺省」和「否」在判断上是两件事，不能合并。
+    KEEP_WHEN_FALSY = {"promotional_signal", "promo_body_hit", "trend_capped",
+                       "body_missing", "passes_truth", "passes_comm", "passes_gate",
+                       "in_window", "is_trend"}
+    out_entries = []
+    for e in result.get("entries", []):
+        r = {}
+        for k in keep:
+            # ★ 必须用 `k not in e`，不能用 `e.get(k)`。
+            # 实测两个 bug 都出在这一行：
+            #   ① 幽灵 null：`e.get()` 对不存在的键返回 None，而 `None in (…, False)`
+            #      为真（`in` 用 == 比较，None == False 为假但 `None in` 会先比
+            #      identity…… 关键是 None 落进了那个元组判断），于是
+            #      record_alert / front_matter / retraction 在全量里 0/141 出现，
+            #      在 compact 里却 141/141 全是 null —— 凭空造键，还让同一个文件里
+            #      出现 `false` 和 `null` 两套空值语义，省幅也从 40% 掉到 24-31%。
+            #   ② `evidence_form` 从来不是条目字段（是 evidence_form_of() 现算的），
+            #      所以它永远 None、永远被删 —— 而它是社交域 70% 权重的那个量。
+            # 只看键【在不在】；空值省略留给下面的 falsy 判断，且只处理真实存在的键。
+            if k not in e:
+                continue
+            v = e[k]
+            if v in (None, "", [], {}) or (v is False and k not in KEEP_WHEN_FALSY):
+                continue                      # 省略空值，省的是 token
+            r[k] = v
+        # evidence_form 是现算的，必须在这里补上：社交域公式
+        # 真实 = 0.30×平台 + 0.70×证据形式，70% 那一项不写下来，下游无法复核，
+        # 却还留着 reconciliation="social-evidence-form" 明示它参与了。
+        try:
+            r["evidence_form"] = evidence_form_of(e)
+        except Exception:
+            pass
+        s = e.get("summary") or ""
+        # ★ 先记下「入库摘要全长」和「它本身是否已被 _clip 截过」。
+        # 实测双重截断陷阱：`_clip()` 的 `…[省略 N 字]…` 标记固定在【第 1401 字】，
+        # 而 compact 只保留前 600 字 —— 标记被截断动作本身销毁了，
+        # 16 条被 _clip 截过的条目在 compact 里【全都看不出自己残缺】。
+        # 最大一条 ieee-spectrum 实际省略 7618 字。下游会把它当成完整摘要。
+        r_full_len = len(s)
+        src_cut = ("…[省略" in s) or bool(e.get("summary_truncated"))
+        if r_full_len > summary_chars:
+            r["summary"] = s[:summary_chars]
+            r["summary_cut"] = r_full_len    # 入库摘要全长，便于需要时回查
+            # 尾部是结论所在（_clip 特意保留 tail=500），compact 把它切掉了 ——
+            # 必须标出来，否则「先给结论」这个要求在精简视图上被静默破坏。
+            r["summary_tail_cut"] = True
+        if src_cut:
+            r["summary_source_truncated"] = True
+            r["summary_note"] = (
+                "本条摘要在入库前已被 _clip 截断（源文更长），"
+                + ("且 compact 又截到 summary_chars="
+                   f"{summary_chars} 字，尾部结论不在本视图里；"
+                   if r_full_len > summary_chars else "但未再被 compact 截断；")
+                + "需要完整摘要读全量 JSON。")
+        out_entries.append(r)
+    return {
+        "schema": "trend-radar/compact-1",
+        "generated_at": result.get("generated_at"),
+        "since": result.get("since"),
+        "window_days": result.get("window_days"),
+        "requested": result.get("requested"),
+        "relevance": result.get("relevance"),
+        "stats": result.get("stats"),
+        # 覆盖情况必须保留：下游「本次覆盖」章节要用它，缺了就没法如实报降级
+        "sources_report": result.get("sources_report"),
+        "source_funnel": result.get("source_funnel"),
+        "degraded_streams": result.get("degraded_streams"),
+        "archive_truncated": result.get("archive_truncated"),
+        "summary_chars": summary_chars,
+        "note": ("精简视图。删掉的键分三类，都【不影响判断】，但性质不同："
+                 "① 可推导或纯记账 —— also_titles / also_event_ids / "
+                 "trend_boards / _capped_in；"
+                 "② 重量级常量 weights（每条运行重复 1.7 KB）；"
+                 "③ ★不可推导、纯为省 token 而删的 published_raw"
+                 "（含时刻 16:24，而 published 归一化到午夜）——"
+                 "需要精确时刻时读全量那份。"
+                 "摘要超长按 summary_chars 截断并标 summary_cut（值为原文全长）。"
+                 "判断所需字段一律保留，含值为 false 的风险标记"
+                 "（promotional_signal / trend_capped / body_missing / record_alert），"
+                 "因为「检查过、无信号」和「没做检查」是两件事。"),
+        "entries": out_entries,
+    }
+
+
+def set_source_timeouts() -> None:
+    """Per-source HTTP timeouts, set from MEASURED maxima -- not from intuition.
+
+    实测全部 30 个源各跑 3 次（2026-10-10）：
+
+        源              最大      中位    说明
+        arxiv-ai       11.29s    9.43s   ← 最慢，但是【合法慢】
+        reddit-ml       7.35s    6.89s   ← 全在等退避，0 条
+        其余 28 个       均 < 4.8s
+
+    ⚠️ 关键结论与直觉相反：**最慢的源需要的是更大的超时，不是更小的。**
+    `arxiv-ai` 慢是因为它对每个分类各发一次请求、每次之间 sleep `ARXIV_GAP=3s`
+    （对 arXiv 的礼貌限流，不能去掉）。4 个分类时耗时 ≈ 9.4 + 3×3 = 18.4s，
+    而全局 TIMEOUT=25s —— 余量很小，网络稍慢就会【截断合法的分类数据】。
+
+    `reddit-ml` **故意不设**：它现在稳定 429、0 条，看起来最该压。但它一旦恢复，
+    成功请求耗时未知（429 的 7.3s 里 6s 是退避，不是响应时间），
+    按限流时的耗时设超时会反过来切断恢复后的正常响应。**没有可靠数字就不设。**
+
+    对快源也【不设小超时】：`_get` 的 timeout 是每次尝试的超时，而快源会
+    `retries=2`；设 2s 会在一次瞬时抖动后于 4-6s 处整体失败 —— 比等 25s 更糟。
+    逐源超时的价值在于【给已知需要更久的源放宽】，不在于给快源上枷锁。
+    """
+    for key in ("arxiv-ai", "arxiv-rss-ai"):
+        if key in SOURCES:
+            SOURCES[key]["timeout"] = 40
+
+
+set_source_timeouts()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Fetch trend-radar structured sources.")
     ap.add_argument("--source", action="append", default=None,
@@ -1877,6 +2087,11 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=3, help="time window in days (default 3)")
     ap.add_argument("--max-per-source", type=int, default=25)
     ap.add_argument("--out", default=None, help="write JSON here (recommended on Windows)")
+    ap.add_argument("--compact", action="store_true",
+                    help="同时写一份精简视图 <out>_compact.json —— 给子代理/下游读，"
+                         "省约一半读入量（去掉可推导字段 + 截断超长摘要）")
+    ap.add_argument("--compact-chars", type=int, default=600,
+                    help="精简视图里摘要保留的字数上限（默认 600）")
     ap.add_argument("--keywords", action="append", default=None,
                     help="阶段5 用：从用户需求里抽出的意图关键词（3-8 个）。"
                          "可重复。不传则用 --request 自动抽取")
@@ -2016,10 +2231,33 @@ def main() -> int:
 
     for key in keys:
         spec = SOURCES[key]
+        # 单源超时隔离。实测：源之间差两个数量级（ithome 14.2s / reddit 17.1s 全在
+        # 等重试 / techreview 0.13s），一个慢源会拖住同路后面所有源。
+        # 每个源可以用 spec["timeout"] 单独设定。
+        src_timeout = spec.get("timeout", TIMEOUT)
+        t0 = time.perf_counter()
+
+        def _row(**kw) -> None:
+            """Append a report row with the per-source wall time attached.
+
+            NOTE: this APPENDS. The first version returned a dict and every call
+            site forgot to use it, so `sources_report` came back empty and
+            `degraded_streams` then reported "该路全部源失败" for a run where all
+            seven sources had succeeded. Returning a value that the caller must
+            remember to store is exactly the shape of bug that hides.
+
+            Measured need for the timing: to find that ithome/reddit were slow I
+            had to write an external timing harness. The script knows this
+            already; not recording it means every future investigation repeats
+            that work.
+            """
+            report.append({"source": key, "label": spec["label"],
+                           "seconds": round(time.perf_counter() - t0, 2), **kw})
+
         try:
             if spec["kind"] == "rss":
                 got = fetch_rss(spec["url"], spec["label"], spec.get("ua"),
-                                spec.get("link_prefer", "alternate"))
+                                spec.get("link_prefer", "alternate"), src_timeout)
             elif spec["kind"] == "atom":
                 got = fetch_atom_arxiv(spec, args.max_per_source)
             elif spec["kind"] == "crossref":
@@ -2062,19 +2300,16 @@ def main() -> int:
                     stale_feeds.append({"source": key, "label": spec["label"],
                                         "newest_item": newest,
                                         "window_start": since.date().isoformat()})
-                    report.append({"source": key, "label": spec["label"],
-                                   "status": "stale-feed", "count": 0,
-                                   "detail": f"最新条目 {newest} 早于窗口起点 "
-                                             f"{since.date().isoformat()}，已整源排除"})
+                    _row(status="stale-feed", count=0,
+                     detail=f"最新条目 {newest} 早于窗口起点 "
+                            f"{since.date().isoformat()}，已整源排除")
                     continue
             entries.extend(got)
-            report.append({"source": key, "label": spec["label"], "status": "ok",
-                           "count": len(got),
-                           **({"archive_truncated": archive_truncated.get(key, 0)}
-                              if key in archive_truncated else {})})
+            _row(status="ok", count=len(got),
+                     **({"archive_truncated": archive_truncated.get(key, 0)}
+                        if key in archive_truncated else {}))
         except urllib.error.HTTPError as exc:
-            report.append({"source": key, "label": spec["label"], "status": "http-error",
-                           "detail": f"HTTP {exc.code}", "count": 0})
+            _row(status="http-error", detail=f"HTTP {exc.code}", count=0)
         except Exception as exc:  # noqa: BLE001 - report and continue
             detail = str(exc)[:200]
             if "timed out" in detail.lower():
@@ -2084,8 +2319,7 @@ def main() -> int:
             # `count` is present on failure rows too: measured, a consumer that
             # iterated the whole report and read r["count"] crashed on the first
             # failure row, which lacked the key.
-            report.append({"source": key, "label": spec["label"], "status": "failed",
-                           "detail": detail, "count": 0})
+            _row(status="failed", detail=detail, count=0)
 
     # ---- 问题3: inject supplemental-search items so they can be scored ----
     # Measured: in a real run the three most reportable items were found by
@@ -2133,8 +2367,8 @@ def main() -> int:
             entry["also_seen_in"] = seen_in
             # 身份去重后的【并集】—— 调用方给的名字可能和 source 是同一家。
             by_identity = len(
-                {entity_id(x) for x in seen_in if entity_id(x)}
-                | {entity_id(entry.get("source_label") or "")}
+                {identity_of(x) for x in seen_in if identity_of(x)}
+                | {identity_of(entry.get("source_label") or "")}
             )
             if isinstance(it.get("pickups"), int) and it["pickups"] > 0:
                 # 显式计数优先（调用方可能看到了脚本看不到的渠道），
@@ -2142,9 +2376,11 @@ def main() -> int:
                 entry["_external_pickups"] = max(it["pickups"], by_identity)
             elif seen_in:
                 entry["_external_pickups"] = by_identity
-            # an external item is never exempt from the time window
+            # an external item is never exempt from the time window.
+            # 同样用【日期】粒度 —— 注入条目带的 date 一律是 `2026-10-09` 这种纯日期，
+            # 用 datetime 比较会把边界日整天误判为窗口外，与主窗口过滤口径不一致。
             dt = _parse_date(entry["published"])
-            if dt is not None and dt < since:
+            if dt is not None and dt.date() < since.date():
                 dropped_external += 1
                 continue
             entries.append(entry)
@@ -2181,7 +2417,17 @@ def main() -> int:
             entry["in_window"] = None
             undated += 1
             kept.append(entry)
-        elif dt >= since:
+        # ★ 必须用【日期】粒度，与 stale-feed 判据一致。
+        # 实测 bug（子代理定位）：这条曾经是 `dt >= since`，而 since 是带时刻的
+        # datetime（2026-10-07T11:05:46Z），Crossref 只给日期粒度
+        # （一律 T00:00:00Z）→ 窗口首日的每一条都被判为"窗口外"。
+        # 实测复现：crossref-natmi 2/2、crossref-nejm 1/1、crossref-nature 2/17
+        # 全是 2026-10-07T00:00:00 被判 `< since` —— 权威面【100% 的"窗口外"
+        # 都是这个假象，没有一条是真旧闻】。
+        # 同一个文件里两个时间判据对同一天给出相反答案，是比单个 bug 更糟的状态：
+        # stale 判据已经改成 .date() 了，这里没跟上。
+        # `<=` 而非 `>=`：边界日整天算【在内】，与 stale 判据的边界处理对齐。
+        elif dt.date() >= since.date():
             entry["in_window"] = True
             kept.append(entry)
         else:
@@ -2562,13 +2808,22 @@ def main() -> int:
         rows = [r for r in report if r["source"] in want]
         ok_rows = [r for r in rows if r["status"] == "ok"]
         got_n = sum(r.get("count", 0) for r in ok_rows)
-        if not ok_rows:
+        # ★ extra-json 的注入条目也算这一路的来源。
+        # 实测口径问题：分母只含注册表键，于是「2/3 源成功，50 条」实际上
+        # 是 3/4 个来源、56 条 —— 注入那么重要（社会面的主要来源），
+        # 在覆盖率口径里却不计入，等于把最有用的一路报小了。
+        ext_rows = [r for r in report
+                    if r["source"] == "extra-json" and (r.get("count") or 0) > 0]
+        if ext_rows:
+            got_n += sum(r["count"] for r in ext_rows)
+        n_total = len(want) + (1 if ext_rows else 0)
+        n_ok = len(ok_rows) + (1 if ext_rows else 0)
+        if not ok_rows and not ext_rows:
             degraded.append({"stream": cls_name, "reason": "该路全部源失败",
-                             "attempted": len(want), "succeeded": 0, "entries": 0})
+                             "attempted": n_total, "succeeded": 0, "entries": 0})
         elif got_n == 0:
             degraded.append({"stream": cls_name, "reason": "该路全部源返回 0 条",
-                             "attempted": len(want), "succeeded": len(ok_rows),
-                             "entries": 0})
+                             "attempted": n_total, "succeeded": n_ok, "entries": 0})
         else:
             # 零产出源单独点名。实测：hnrss 抓 20 条、被 hn-frontpage 全额判重合并、
             # emitted=0 —— 一个源等于不存在，但 status 是 ok，所以既不进 failed
@@ -2579,14 +2834,15 @@ def main() -> int:
             failing = sorted(r["source"] for r in rows if r["status"] != "ok")
             if len(ok_rows) < len(want):
                 degraded.append({"stream": cls_name,
-                                 "reason": f"该路有源失败（{len(ok_rows)}/{len(want)} 成功）",
-                                 "attempted": len(want), "succeeded": len(ok_rows),
+                                 "reason": f"该路有源失败（{n_ok}/{n_total} 来源可用）",
+                                 "attempted": n_total, "succeeded": n_ok,
                                  "entries": got_n, "failed_sources": failing,
+                                 **({"injected_extras": len(ext_rows)} if ext_rows else {}),
                                  **({"zero_yield_sources": dead} if dead else {})})
             elif dead:
                 degraded.append({"stream": cls_name,
                                  "reason": f"该路有源零产出（抓到了但一条没落地：{','.join(dead)}）",
-                                 "attempted": len(want), "succeeded": len(ok_rows),
+                                 "attempted": n_total, "succeeded": n_ok,
                                  "entries": got_n, "zero_yield_sources": dead})
 
     result = {
@@ -2650,6 +2906,18 @@ def main() -> int:
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text)
+        # 方案A：同时写一份精简视图给【子代理/主窗口读】。
+        # 实测收益：全量 320 KB → 精简 158 KB（三路合计），省约一半读入量。
+        # 成本几乎全在 summary（均 1031 B/条），所以按字数截断是主要手段；
+        # 另外 `weights`（1.7 KB 常量，每次重复）、`published_raw`、`also_titles`、
+        # `also_event_ids` 都是可推导的冗余，直接不写。
+        if args.compact:
+            cpath = pathlib.Path(args.out).with_name(
+                pathlib.Path(args.out).stem + "_compact.json")
+            cpath.write_text(json.dumps(compact_view(result, args.compact_chars),
+                                        ensure_ascii=False, indent=1),
+                             encoding="utf-8")
+            print(f"wrote {cpath}  (精简视图，给下游读)")
         ok = [r for r in report if r["status"] == "ok"]
         bad = [r for r in report if r["status"] != "ok"]
         print(f"wrote {args.out}")
@@ -2658,6 +2926,18 @@ def main() -> int:
             print(f"    [ok]   {r['source']:22} {r['count']} 条")
         for r in bad:
             print(f"    [FAIL] {r['source']:22} {r['status']} {r.get('detail','')}")
+
+        # 逐源耗时汇总。实测需要：为了查出哪个源慢，我写了一次性外部计时脚本；
+        # 而脚本自己就知道。不打印出来，下次调查还要重做一遍。
+        timed = sorted((r for r in report if r.get("seconds") is not None),
+                       key=lambda r: r["seconds"], reverse=True)
+        if timed:
+            slow = [r for r in timed if r["seconds"] >= 5.0]
+            print(f"  耗时         : 合计 {sum(r['seconds'] for r in timed):.1f}s"
+                  f" | 最慢 {timed[0]['source']} {timed[0]['seconds']}s"
+                  + (f" | ≥5s 的源: " +
+                     ", ".join(f"{r['source']}={r['seconds']}s" for r in slow)
+                     if slow else ""))
         print(f"  entries      : {result['stats']['kept']} kept / {result['stats']['raw']} raw "
               f"({dropped} out-of-window, {undated} undated, "
               f"{result['stats']['duplicates_merged']} duplicates merged, "
@@ -2704,6 +2984,12 @@ def main() -> int:
                   "do not present a partial sweep as complete.")
     else:
         print(text)
+        # --compact 依赖 --out 才有地方写精简视图。之前是静默什么都不做，
+        # 而文档把 --compact 列为「必加参数」—— 调用方以为拿到了精简视图，实际没有。
+        if args.compact:
+            print("warning: --compact 需要配合 --out 才会写精简视图；"
+                  "本次没有 --out，已忽略 --compact。"
+                  "（全量 JSON 走的是 stdout，没有精简版可写）", file=sys.stderr)
     return 0
 
 

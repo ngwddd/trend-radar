@@ -302,6 +302,26 @@ check("事件ID：不同事件仍不同",
       != ff.event_id("OpenAI releases a new reasoning model"), True)
 check("实体归一：央视新闻 = 央视网", ff.entity_id("央视新闻"), ff.entity_id("央视网"))
 check("实体归一：中新社 = 中国新闻网", ff.entity_id("中新社"), ff.entity_id("中国新闻网"))
+# ★ 下面这组是子代理指出「79/0 不能当上线依据」之后补的。
+# 原来只有「应合并」断言，所以一个方向相反的过归一 bug 完全隐形：
+# identity_of 曾返回 platform_of() 的结果，而那是【权重桶】——
+# 新京报/南方都市报同属 bjnews 档、民政部/财政部同属 gov-cn 档，于是
+# 16 组独立媒体被判错 11 组，【真实的多源印证被吞掉】，pickups 永远等于 1，
+# comm 卡在 0.35 进不了核心区。只测「应合并」永远发现不了这个。
+check("实体归一：新京报 ≠ 南方都市报（同档不同家）",
+      ff.entity_id("新京报") != ff.entity_id("南方都市报"), True)
+check("实体归一：广州日报 ≠ 北京日报",
+      ff.entity_id("广州日报") != ff.entity_id("北京日报"), True)
+check("实体归一：界面新闻 ≠ 财新",
+      ff.entity_id("界面新闻") != ff.entity_id("财新"), True)
+check("实体归一：民政部 ≠ 财政部（30 个部委不能塌成一个）",
+      ff.entity_id("民政部") != ff.entity_id("财政部"), True)
+check("实体归一：国家医保局 ≠ 国家疾控局",
+      ff.entity_id("国家医保局") != ff.entity_id("国家疾控局"), True)
+check("实体归一：「新闻」是品牌名的一部分，不剥离",
+      ff.entity_id("界面新闻"), "界面新闻")
+check("平台权重桶仍然按档合并（权重查询不受影响）",
+      ff.platform_of("", "新京报"), ff.platform_of("", "南方都市报"))
 check("导购文识别",
       ff.is_promotional({"title": "米家净水器2 Pro到手价2999元 直达链接",
                          "summary": "京东开售"}), True)
@@ -374,8 +394,73 @@ if rc == 0 and out_path.exists():
           len(d.get("archive_truncated") or {}) > 0, True)
     check("event_id 存在于条目",
           all(e.get("event_id") for e in d["entries"]), True)
+
+# ---- 精简视图（--compact）：验「判断所需字段一个未删」不是一句空话 ----
+out_c = TMP / "acc_compact.json"
+rc, _ = run("--domain", "ai", "--class", "social", "--days", "3",
+            "--max-per-source", "8", "--compact", "--out", str(out_c))
+comp_path = out_c.with_name(out_c.stem + "_compact.json")
+if rc == 0 and comp_path.exists():
+    cf = load(out_c)
+    cc = load(comp_path)
+    check("compact 视图生成", comp_path.exists(), True)
+    check("compact 体积小于全量", comp_path.stat().st_size < out_c.stat().st_size, True)
+    check("compact 保留全部条目数",
+          len(cc["entries"]), len(cf["entries"]))
+    # 风险标记【键存在但值为 false 时也必须保留】—— 「检查过、无信号」和
+    # 「没做检查」是两件事。实测 bug：省略逻辑用 falsy 通杀，promotional_signal
+    # 被删光，230 条全部评估过、compact 里 0 条保留。
+    #
+    # ★ 判据必须拿【全量】当基准，不能要求 compact 里每条都有这个键：
+    #   契约是「全量里有的键，值为 falsy 也要保留」，不是「凭空造出全量里没有的键」。
+    #   第一版断言写成 `all(key in e for e in compact)`，于是只要某个标记是
+    #   【条件赋值】（trend_capped 只打在热度榜条目上、body_missing 只打在无正文
+    #   条目上），非该类条目就会 FAIL —— 那是测试写错了，不是代码错了。
+    #   反过来，「为不存在的键写 null」是另一个真 bug（幽灵 null），
+    #   所以两个方向都要测。
+    full_eval = {key: sum(1 for e in cf["entries"] if key in e)
+                 for key in ("promotional_signal", "trend_capped", "body_missing")}
+    ck_all = set()
+    for e in cf["entries"]:
+        ck_all |= set(e.keys())
+    for key in ("section", "truth_score", "comm_score", "event_id", "evidence_form"):
+        check(f"compact 每条都有 {key}", all(key in e for e in cc["entries"]), True)
+    for key, n in full_eval.items():
+        check(f"compact 保留 {key}（全量有 {n} 条，值为 falsy 也要留）",
+              sum(1 for e in cc["entries"] if key in e), n)
+    # 例外名单 = compact 视图【有意新增】的派生字段（都有实际内容，不是 null）。
+    # 幽灵 null 的定义是「全量里没有、compact 里凭空写成 None」，所以下面单独测 null。
+    derived = {"summary_cut", "summary_tail_cut", "summary_source_truncated",
+               "summary_note", "evidence_form"}
+    stray = [k for e in cc["entries"] for k in e
+             if k not in ck_all and k not in derived]
+    check("compact 不凭空造键（幽灵 null 回归）", stray, [])
+    check("compact 里没有 null 值字段",
+          sum(1 for e in cc["entries"] for v in e.values() if v is None), 0)
+    check("compact 保留覆盖情况（degraded_streams / source_funnel / sources_report）",
+          all(k in cc for k in ("degraded_streams", "source_funnel", "sources_report")), True)
+    # 摘要截断必须标出处，否则下游会以为拿到全文
+    cut = [e for e in cc["entries"] if e.get("summary_cut")]
+    full_by_title = {e["title"]: len(e.get("summary") or "") for e in cf["entries"]}
+    check("summary_cut 的值 = 全量摘要长度（区别于来源原文长度）",
+          all(full_by_title.get(e["title"]) == e["summary_cut"] for e in cut), True)
+    check("每个被截断的条目都有 summary_cut",
+          all("summary_cut" in e for e in cc["entries"]
+              if len(e.get("summary") or "") >= 600), True)
+    # 双重截断必须可见。实测陷阱：`_clip()` 的 `…[省略 N 字]…` 标记固定在
+    # 第 1401 字，而 compact 只留 600 字 —— 标记被截断动作本身销毁，
+    # 16 条残缺摘要全都看不出自己残缺，下游会当成完整摘要用。
+    fs_n = sum(1 for e in cf["entries"] if e.get("summary_truncated"))
+    cs_n = sum(1 for e in cc["entries"] if e.get("summary_source_truncated"))
+    check(f"入库被 _clip 截过的条目在 compact 里可见（全量 {fs_n} 条）", cs_n, fs_n)
+    check("被 compact 再截的条目标了 summary_tail_cut（尾部结论不在本视图）",
+          all(e.get("summary_tail_cut") for e in cc["entries"] if e.get("summary_cut")), True)
+    check("compact 摘要是全量的前缀",
+          all(e["summary"] == (next(x for x in cf["entries"]
+                                    if x["title"] == e["title"]).get("summary") or "")[:len(e["summary"])]
+              for e in cc["entries"]), True)
 else:
-    check("新增功能用例运行成功", False, True)
+    check("精简视图用例运行成功", False, True)
 
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):
