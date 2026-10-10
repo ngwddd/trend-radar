@@ -191,6 +191,19 @@ CROSS_CONFIRM_CAP = 1.0
 # The gate the pipeline uses on 真实 / 传播报道.
 CREDIBILITY_THRESHOLD = 0.6
 
+# 单源硬证据通道的合格证据类型。
+#
+# ★ 只有 `peer-reviewed`。理由：这是唯一**本身就含独立核验**的类型 ——
+# 同行评审是第三方做的。`official` 虽然是一手，但**没有独立核验**，
+# 而且官方是自我利益相关方（厂商说自己的模型好，那是自述不是证据）。
+# 实测教训：一开始把 official 也放进来，结果 openai-news 那 6 条客户案例
+# 被"official"这个标签护送进了核心区 —— 营销内容进了本该放最硬证据的地方。
+# 收紧到只剩 peer-reviewed 之后，核心区是 1 条 Nat Comput Sci 论文。
+#
+# 刻意【不】用源权重阈值来判（如 source_weight>=0.9）：那会变成第二套层级实现，
+# 而实测教训是「同一件事两处实现必然打架」（identity_of/entity_id 就是活例）。
+HARD_EVIDENCE_TYPES = frozenset({"peer-reviewed"})
+
 # ---------------------------------------------------------------------------
 # 问题4 修复：社会域没有权威源，无法做权威交叉核对 → 走另一套核对系统
 #
@@ -2316,6 +2329,7 @@ def compact_view(result: dict, summary_chars: int = 600) -> dict:
             "evidence_type", "reconciliation", "event_id", "score_source",
             "truth_score", "comm_score", "pickups", "section", "gate_note",
             "passes_truth", "passes_comm", "passes_gate",
+            "corroborated", "single_source_hard_evidence",
             "also_seen_in", "corroborated_by",
             "promotional_signal", "promo_body_hit", "promo_note",
             "customer_story", "customer_story_note",
@@ -3061,12 +3075,42 @@ def main() -> int:
             c_ok = entry["comm_score"] >= CREDIBILITY_THRESHOLD
         entry["passes_truth"] = t_ok
         entry["passes_comm"] = c_ok
-        entry["passes_gate"] = t_ok and c_ok
+        # ★ 单源硬证据通道。闸门本身不改（comm<0.6 确实=未经独立印证），
+        # 改的是【不让它与不可信混为一谈】。
+        #
+        # 实测问题（三个域都复现）：真值 0.896–0.912 的同行评审论文、0.816 的厂商
+        # 官方发布，全部因 comm=0.30 卡在待观察区 → 核心区结构性为空。
+        # 根因：`comm>=0.6 需 >=2 家独立转载` 是给【社会面】设计的规则，
+        # 而学术首发与官方发布天然是单源 —— 新论文上线第一时间只有一家报。
+        # 把这两种情况都归入"未印证"，等于让最硬的证据永远进不了核心区。
+        #
+        # 判据刻意收得很窄：【证据类型】已是 peer-reviewed 或 official
+        # （而不是靠源权重阈值，避免又出现两套可能打架的实现），
+        # 且真值达标。趋势榜已被上面的 trend_capped 硬闸挡在外面，不会受益。
+        #
+        # ⚠️ 这类条目**仍然是单源**，所以下游必须能看到这一点 ——
+        # 靠 `corroborated=False` + gate_note 明写，而不是悄悄放行。
+        entry["corroborated"] = bool(c_ok)
+        entry["single_source_hard_evidence"] = bool(
+            t_ok and not c_ok and not entry.get("trend_capped")
+            # ★ 客户案例不得走这条通道。实测：`official` 是来源标签，
+            # 而 openai-news 的客户案例也带这个标签 —— 不排除的话，
+            # 「某公司用我们的产品省了 96%」这种营销内容会被护送进核心区。
+            and not entry.get("customer_story")
+            and entry.get("evidence_type") in HARD_EVIDENCE_TYPES)
+        entry["passes_gate"] = bool(t_ok and (c_ok or entry["single_source_hard_evidence"]))
         # `section` is written for EVERY entry, including passers. Measured bug:
         # `gate_note` existed only on non-passers, so consumers hit
         # KeyError: 'gate_note' on exactly the successful items. A field that
         # appears only on failures is a trap for whoever reads the successes.
-        if entry["passes_gate"]:
+        if entry["passes_gate"] and entry["single_source_hard_evidence"]:
+            entry["section"] = "核心区"
+            entry["gate_note"] = (
+                "★ 单源硬证据通道：真值达标 + 证据类型为 "
+                f"{entry.get('evidence_type')}，但【未经独立印证】"
+                f"（comm={entry['comm_score']}）。可引用，必须标注单源。")
+            passed_both += 1
+        elif entry["passes_gate"]:
             entry["section"] = "核心区"
             entry["gate_note"] = "双项达标 → 核心区"
             passed_both += 1
@@ -3078,6 +3122,16 @@ def main() -> int:
         elif c_ok and not t_ok:
             entry["section"] = "存疑区"
             entry["gate_note"] = "传播达标/真实未达标 → 存疑区"
+            passed_comm += 1
+        elif entry.get("customer_story") and not c_ok:
+            # 厂商官网的客户案例/成果叙事：真值分高（官方一手）但【不是独立验证】，
+            # 而且它是营销内容。实测：不单独归类的话，6 条「某公司用我们的产品
+            # 省了 96%」会与真公告一起堆在待观察区顶部、分数完全相同。
+            # 放进存疑区 —— 语义准确（声称可信但未经独立核验），
+            # 同时不占待观察区的名额。
+            entry["section"] = "存疑区"
+            entry["gate_note"] = ("厂商客户案例/成果叙事 → 存疑区：官方一手但**不是独立验证**，"
+                                  "且属营销内容。可作厂商口径样本，不可作事实依据。")
             passed_comm += 1
         elif entry.get("trend_capped"):
             # 热度榜条目不是"没达标"，它是【刻意不占预算的校准信号】。

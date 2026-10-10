@@ -667,6 +667,40 @@ if _rc == 0 and _z.exists():
 else:
     check("0 条源漏斗用例运行成功", False, True)
 
+print("\n[13] 单源硬证据通道 / 客户案例不得进核心区")
+# 背景：三域实测一致 —— 真值 0.896–0.912 的同行评审论文、0.816 的厂商官方发布，
+# 全部因 comm=0.30 卡在待观察区 → **核心区结构性为空**。
+# 根因：`comm>=0.6 需 >=2 家独立转载` 是给社会面设计的，而学术首发天然单源。
+# 修法：只给【peer-reviewed】开一条显式单源通道（含独立核验的类型），
+# 且必须标 corroborated=False。
+#
+# ⚠️ 这一节的核心是【反向断言】—— 试过把 official 也放进来，
+#    结果 openai-news 那 6 条客户案例被 "official" 标签护送进了核心区。
+_gt = TMP / "acc_gate.json"
+_rc, _ = run("--domain", "ai", "--class", "authority", "--days", "3",
+             "--max-per-source", "15", "--compact", "--out", str(_gt))
+if _rc == 0 and _gt.exists():
+    _dg = load(_gt)
+    _core = [e for e in _dg["entries"] if e["section"] == "核心区"]
+    _cs_core = [e for e in _core if e.get("customer_story")]
+    check("客户案例【不得】进核心区", _cs_core, [])
+    check("核心区里的单源条目都是 peer-reviewed",
+          sorted({e.get("evidence_type") for e in _core
+                  if e.get("single_source_hard_evidence")}) in ([], ["peer-reviewed"]), True)
+    check("单源通道条目必须标 corroborated=False",
+          all(e.get("corroborated") is False for e in _core
+              if e.get("single_source_hard_evidence")), True)
+    check("official 类型不得走单源通道进核心区",
+          [e.get("title") for e in _core if e.get("evidence_type") == "official"], [])
+    # 自洽性：kept 必须等于四桶之和（实测曾出现 kept=32 而四桶和=507）
+    _s = _dg["stats"]
+    check("闸门自洽：kept == len(entries) == 四桶之和",
+          (_s["kept"], len(_dg["entries"]),
+           _s["passed_both"] + _s["truth_only"] + _s["comm_only"] + _s["failed_gate"]),
+          (_s["kept"], _s["kept"], _s["kept"]))
+else:
+    check("单源通道用例运行成功", False, True)
+
 print("\n[9] 回归 · 已有两套测试仍通过")
 for name in ("test_retraction.py", "test_historical.py"):
     p = subprocess.run([sys.executable, str(SKILL / "tests" / name)],
