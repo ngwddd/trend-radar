@@ -1,0 +1,20 @@
+# 行尾策略：仓库内一律 LF，检出时也一律 LF。
+#
+# 为什么必须显式声明：Windows 上 git 默认 core.autocrlf=true，会把工作区
+# 变成 CRLF、入库变回 LF。后果是**工作区字节数与远端字节数不同**，
+# 实测 scripts/fetch_feeds.py 本地 159013 B / 远端 155937 B。
+# 校验哈希时两边必然对不上，而这类"数字对不上"极难排查 ——
+# 独立复核时就为此刻意标注过「这份 sha256 是工作区 CRLF 字节，clone 后全部失效」。
+#
+# 钉死之后：仓库里、检出后、CI 上，同一个文件永远是同一串字节。
+* text=auto eol=lf
+
+# 明确二进制，避免 git 尝试做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.pdf binary
+*.zip binary
+*.pyc binary
