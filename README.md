@@ -24,7 +24,7 @@
 cd ~/.dsh/skills/trend-radar
 git add -A; git commit -m "…"; git push
 # 再同步到模板（两处应逐字节一致）
-robocopy . "C:\Users\ggg\Desktop\DeepSeek 产出\trend-radar.skill.模板" /MIR /XD .git __pycache__ /XF _*
+robocopy . "$env:USERPROFILE\Desktop\DeepSeek 产出\trend-radar.skill.模板" /MIR /XD .git __pycache__ /XF _*
 ```
 
 > ⚠️ **`git status` 会把 `docs\` 里的改动报成 modified** —— 那是正常的，
